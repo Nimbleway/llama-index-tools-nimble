@@ -1,0 +1,33 @@
+name: Release
+
+# Publishes to PyPI via Trusted Publishing (OIDC, no token) when a GitHub Release
+# is published. The PyPI project's "trusted publisher" must be configured once by an
+# admin (https://docs.pypi.org/trusted-publishers/). The release tag must be vX.Y.Z
+# and match the version in pyproject.toml.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v3
+      - name: Verify tag matches pyproject version
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"(.*)".*/\1/')
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "pyproject=$VERSION tag=$TAG"
+          [ "$VERSION" = "$TAG" ] || { echo "::error::tag $TAG != version $VERSION"; exit 1; }
+      - name: Build
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
