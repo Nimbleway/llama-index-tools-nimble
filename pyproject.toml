@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Nimble Web Search tool for LlamaIndex"
 license = { text = "MIT" }
 readme = "README.md"
-authors = []
+authors = [{ name = "Nimbleway" }]
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",

@@ -64,7 +64,7 @@ A runnable version is in [`examples/nimble_agent.py`](examples/nimble_agent.py).
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `query` | `str` | — | The search query. |
-| `max_results` | `int` | `6` | Maximum number of results to return. |
+| `max_results` | `int` | `6` | Maximum number of results to return (must be ≥ 1). |
 
 Each result becomes a `Document`. The `text` leads with the page **title** and **URL**, then
 the page content (or the snippet when content is empty), so an agent can read and cite the

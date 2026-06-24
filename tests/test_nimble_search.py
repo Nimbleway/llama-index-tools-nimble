@@ -98,13 +98,22 @@ def test_all_empty_fields_still_produce_non_empty_text(monkeypatch):
         [_result(content="", description="", title="", url="")], monkeypatch
     )
     docs = spec.search("q")
-    assert docs[0].text  # never empty — an empty Document.text breaks downstream nodes
+    # never empty: an empty Document.text breaks downstream nodes
+    assert "URL:" in docs[0].text
 
 
-def test_max_results_must_be_positive(monkeypatch):
+def test_hard_caps_results_at_max_results(monkeypatch):
+    # Nimble's max_results is a soft cap; the tool must enforce it client-side.
+    results = [_result(content=f"body {i}", url=f"https://x/{i}") for i in range(10)]
+    spec, _ = _spec_with_results(results, monkeypatch)
+    assert len(spec.search("q", max_results=3)) == 3
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_max_results_must_be_positive(monkeypatch, bad):
     spec, _ = _spec_with_results([], monkeypatch)
     with pytest.raises(ValueError):
-        spec.search("q", max_results=0)
+        spec.search("q", max_results=bad)
 
 
 def test_init_without_api_key_does_not_raise(monkeypatch):
