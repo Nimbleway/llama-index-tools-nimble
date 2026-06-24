@@ -6,6 +6,10 @@ __pycache__/
 build/
 dist/
 
+# secrets
+.env
+.env.*
+
 # venv / tooling caches
 .venv/
 .pytest_cache/

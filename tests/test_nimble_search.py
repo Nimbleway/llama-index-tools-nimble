@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from llama_index.core.schema import Document
 
 from llama_index.tools.nimble import NimbleToolSpec
@@ -74,3 +75,41 @@ def test_to_tool_list_exposes_search(monkeypatch):
     tools = spec.to_tool_list()
     names = {t.metadata.name for t in tools}
     assert "search" in names
+
+
+def test_to_tool_list_search_has_description(monkeypatch):
+    spec, _ = _spec_with_results([], monkeypatch)
+    tool = next(t for t in spec.to_tool_list() if t.metadata.name == "search")
+    # the docstring is the description the LLM reads to decide how to call the tool
+    assert tool.metadata.description
+
+
+def test_empty_body_keeps_title_and_url(monkeypatch):
+    spec, _ = _spec_with_results(
+        [_result(content="", description="", title="T", url="https://x.com")],
+        monkeypatch,
+    )
+    docs = spec.search("q")
+    assert docs[0].text == "T\nURL: https://x.com"
+
+
+def test_all_empty_fields_still_produce_non_empty_text(monkeypatch):
+    spec, _ = _spec_with_results(
+        [_result(content="", description="", title="", url="")], monkeypatch
+    )
+    docs = spec.search("q")
+    assert docs[0].text  # never empty — an empty Document.text breaks downstream nodes
+
+
+def test_max_results_must_be_positive(monkeypatch):
+    spec, _ = _spec_with_results([], monkeypatch)
+    with pytest.raises(ValueError):
+        spec.search("q", max_results=0)
+
+
+def test_init_without_api_key_does_not_raise(monkeypatch):
+    import nimble_python
+
+    monkeypatch.setattr(nimble_python, "Nimble", lambda **kwargs: MagicMock())
+    spec = NimbleToolSpec()  # api_key=None -> SDK reads NIMBLE_API_KEY
+    assert spec.client is not None

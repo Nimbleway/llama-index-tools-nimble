@@ -24,7 +24,7 @@ Repository = "https://github.com/Nimbleway/llama-index-tools-nimble"
 
 # LlamaHub registry metadata (mirrors llama-index-tools-tavily-research).
 [tool.llamahub]
-contains_example = false
+contains_example = true
 import_path = "llama_index.tools.nimble"
 
 [tool.llamahub.class_authors]
@@ -45,7 +45,7 @@ test = [
     "pytest-mock>=3.10.0,<4.0.0",
 ]
 lint = [
-    "ruff>=0.13.1,<0.14.0",
+    "ruff>=0.9",
 ]
 typing = [
     "mypy>=1.10.0,<2.0.0",

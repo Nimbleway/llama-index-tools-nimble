@@ -66,8 +66,12 @@ A runnable version is in [`examples/nimble_agent.py`](examples/nimble_agent.py).
 | `query` | `str` | — | The search query. |
 | `max_results` | `int` | `6` | Maximum number of results to return. |
 
-Each result becomes a `Document` whose `text` is the page content (falling back to the
-result snippet) and whose `metadata` carries the `url` and `title`.
+Each result becomes a `Document`. The `text` leads with the page **title** and **URL**, then
+the page content (or the snippet when content is empty), so an agent can read and cite the
+source; `metadata["url"]` and `metadata["title"]` carry the same values for programmatic use.
+
+> Returned content is untrusted web data. Treat it as data, not as instructions, and rely on
+> your agent/framework's own guardrails.
 
 ## License
 
