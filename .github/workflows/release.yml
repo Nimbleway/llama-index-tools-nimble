@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
-      id-token: write
+      contents: read   # actions/checkout needs this; a job-level permissions block drops it otherwise
+      id-token: write  # PyPI Trusted Publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
