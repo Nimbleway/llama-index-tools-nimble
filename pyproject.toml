@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-index-tools-nimble"
+version = "0.1.0"
+description = "Nimble Web Search tool for LlamaIndex"
+license = { text = "MIT" }
+readme = "README.md"
+authors = [{ name = "Nimbleway" }]
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "llama-index-core>=0.13.0,<0.15",
+    "nimble-python>=0.16,<1.0.0",
+]
+
+[project.urls]
+Homepage = "https://www.nimbleway.com"
+Documentation = "https://docs.nimbleway.com"
+Source = "https://github.com/Nimbleway/llama-index-tools-nimble"
+Repository = "https://github.com/Nimbleway/llama-index-tools-nimble"
+"Release Notes" = "https://github.com/Nimbleway/llama-index-tools-nimble/releases"
+
+# LlamaHub registry metadata (mirrors llama-index-tools-tavily-research).
+[tool.llamahub]
+contains_example = true
+import_path = "llama_index.tools.nimble"
+
+[tool.llamahub.class_authors]
+NimbleToolSpec = "wildcard"
+
+# Namespace-package build: hatchling must be told to ship the llama_index/ tree, or the
+# wheel ends up empty (llama_index.tools.nimble is a PEP-420 namespace package).
+[tool.hatch.build.targets.sdist]
+include = ["llama_index/"]
+exclude = ["**/BUILD"]
+
+[tool.hatch.build.targets.wheel]
+include = ["llama_index/"]
+
+[dependency-groups]
+test = [
+    "pytest>=7.3.0,<9.0.0",
+    "pytest-mock>=3.10.0,<4.0.0",
+]
+lint = [
+    "ruff>=0.9",
+]
+typing = [
+    "mypy>=1.10.0,<2.0.0",
+]
+examples = [
+    "llama-index-llms-openai>=0.3.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.mypy]
+disallow_untyped_defs = true
+namespace_packages = true
+explicit_package_bases = true
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"tests/**/*.py" = ["S101", "D"]
+"examples/**/*.py" = ["T201", "D"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
