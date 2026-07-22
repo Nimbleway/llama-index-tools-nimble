@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-index-tools-nimble"
-version = "0.1.0"
+version = "0.2.0"
 description = "Nimble Web Search tool for LlamaIndex"
 license = { text = "MIT" }
 readme = "README.md"
@@ -12,7 +12,7 @@ authors = [{ name = "Nimbleway" }]
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",
-    "nimble-python>=0.16,<1.0.0",
+    "nimble-python>=1.0.0,<2.0.0",
 ]
 
 [project.urls]
@@ -29,6 +29,7 @@ import_path = "llama_index.tools.nimble"
 
 [tool.llamahub.class_authors]
 NimbleToolSpec = "wildcard"
+NimbleAgentToolSpec = "wildcard"
 
 # Namespace-package build: hatchling must be told to ship the llama_index/ tree, or the
 # wheel ends up empty (llama_index.tools.nimble is a PEP-420 namespace package).

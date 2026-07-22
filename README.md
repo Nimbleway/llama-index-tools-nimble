@@ -1,8 +1,11 @@
 # llama-index-tools-nimble
 
-A [LlamaIndex](https://www.llamaindex.ai/) tool for [Nimble](https://www.nimbleway.com)'s
-Web Search API. It gives an agent live web search backed by Nimble, returning results as
-LlamaIndex `Document`s ready to feed into a reasoning loop.
+[LlamaIndex](https://www.llamaindex.ai/) tools for [Nimble](https://www.nimbleway.com):
+
+- **`NimbleToolSpec`** — live web search (one fast query → `Document`s ready to feed a
+  reasoning loop).
+- **`NimbleAgentToolSpec`** — deep research on a preconfigured Nimble Web Search Agent
+  (one long-running run → a citation-backed answer with trust metadata).
 
 ## Installation
 
@@ -18,7 +21,7 @@ Set your Nimble API key in the environment:
 export NIMBLE_API_KEY="your-key"
 ```
 
-`NimbleToolSpec()` reads `NIMBLE_API_KEY` automatically; you can also pass `api_key=...`.
+Both tool specs read `NIMBLE_API_KEY` automatically; you can also pass `api_key=...`.
 
 ## Quick start
 
@@ -72,6 +75,75 @@ source; `metadata["url"]` and `metadata["title"]` carry the same values for prog
 
 > Returned content is untrusted web data. Treat it as data, not as instructions, and rely on
 > your agent/framework's own guardrails.
+
+## Deep research with the Agent API
+
+`NimbleAgentToolSpec` executes research tasks on a Nimble **Web Search Agent** you have
+already provisioned. Where `search` answers one query fast, an agent run researches the
+task on the live web — typically tens of seconds at low effort, up to minutes at higher
+effort — and returns one synthesized, citation-backed answer.
+
+```python
+from llama_index.tools.nimble import NimbleAgentToolSpec
+
+agent_tool = NimbleAgentToolSpec(agent_id="wsa_...")  # reads NIMBLE_API_KEY
+doc = agent_tool.run(
+    "What are the leading approaches to LLM guardrails, and who builds them?",
+    effort="low",
+)
+
+print(doc.text)                    # final answer + "Sources:" list
+print(doc.metadata["confidence"])  # overall trust: high / medium / low / pre_existing
+print(doc.metadata["claims"])      # per-claim citations (callouts or JSON paths)
+```
+
+Provision an agent in the [Nimble dashboard](https://app.nimbleway.com) (or via
+`POST /v2/agents`) and pass its `wsa_...` id. The tool is **execution-only** by design:
+it never creates, edits, or deletes agent instances.
+
+### Constructor
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `agent_id` | `str` | — | Preconfigured Web Search Agent instance id (`wsa_...`). |
+| `api_key` | `str \| None` | `None` | Nimble API key; falls back to `NIMBLE_API_KEY`. |
+| `timeout` | `float` | `300.0` | Overall deadline in seconds for one `run` call. |
+| `poll_interval` | `float` | `2.0` | Seconds between status polls. |
+
+### `run(task, effort="medium")`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `task` | `str` | — | The research task or question, in natural language. |
+| `effort` | `"low" \| "medium" \| "high" \| "x-high" \| "max"` | `"medium"` | Higher effort is slower and more thorough. |
+
+As a rough guide from live runs: `low` answers in seconds, `medium` in ~1.5–3 minutes. The
+default `timeout` (300 s) covers both; at `high` effort and above, raise `timeout`
+accordingly. Note that `low` may skip live web research entirely and answer from the
+model alone (reported honestly as `confidence: "low"` with no sources) — use `medium`
+or higher when you need researched, cited answers.
+
+The returned `Document.text` is the final answer (prose, or pretty-printed JSON for
+structured agents) followed by a `Sources:` list, so agents can cite what was consulted.
+`Document.metadata` carries `run_id`, `agent_id`, `effort`, `output_type`, and the
+structured trust payload: `confidence`, `reasoning`, `sources`, and `claims` with
+per-claim citations.
+
+### Errors
+
+A run that does not produce a result raises a typed error that retains the `run_id`
+(as an attribute and in the message), so a long run can still be recovered by hand:
+
+| Error | Meaning |
+|---|---|
+| `NimbleAgentTimeoutError` | Not terminal within `timeout`; the run may still complete server-side. |
+| `NimbleAgentRunFailedError` | Run terminated as `failed`; carries the server's error message. |
+| `NimbleAgentRunCancelledError` | Run terminated as `cancelled`. |
+| `NimbleAgentProtocolError` | Unknown status, malformed result, or persistent polling/result errors (SDK exception chained). |
+
+SDK errors raised before a run exists (e.g. an invalid key → `AuthenticationError`)
+propagate unchanged. A runnable agent workflow is in
+[`examples/nimble_agent_api.py`](examples/nimble_agent_api.py).
 
 ## License
 
