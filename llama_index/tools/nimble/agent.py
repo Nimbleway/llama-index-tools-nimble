@@ -106,9 +106,8 @@ class NimbleAgentToolSpec(BaseToolSpec):
         Args:
             task (str): The research task or question, in natural language.
                 Be specific about what the answer should contain.
-            effort (str): How much research effort to spend: "low", "medium",
-                "high", "x-high", or "max". Higher effort is slower and more
-                thorough.
+            effort (str): One of "low", "medium", "high", "x-high", or "max".
+                Higher effort is slower and more thorough.
 
         Returns:
             A Document. Its text is the agent's final answer (prose, or JSON

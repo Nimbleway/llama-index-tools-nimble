@@ -503,15 +503,22 @@ def test_to_tool_list_exposes_run_with_description(monkeypatch):
 
 
 def test_param_descriptions_reach_the_tool_schema(monkeypatch):
-    # LlamaIndex's docstring parser requires the `name (type): desc` form;
-    # without it the per-parameter descriptions silently never reach the
-    # JSON schema a function-calling model reads.
+    # LlamaIndex's docstring parser requires the `name (type): desc` form AND
+    # captures only the first physical line — so each param's first line must
+    # be a complete, self-contained description or the schema text a
+    # function-calling model reads ends up truncated mid-sentence.
     spec, _, _ = _spec(monkeypatch)
     tool = next(t for t in spec.to_tool_list() if t.metadata.name == "run")
     fields = tool.metadata.fn_schema.model_fields
-    assert fields["task"].description
-    assert fields["effort"].description
-    assert "research" in fields["task"].description.lower()
+
+    task_desc = fields["task"].description
+    assert task_desc and "research" in task_desc.lower()
+    assert task_desc.rstrip().endswith(".")
+
+    effort_desc = fields["effort"].description
+    assert effort_desc and effort_desc.rstrip().endswith(".")
+    for level in ("low", "medium", "high", "x-high", "max"):
+        assert f'"{level}"' in effort_desc
 
 
 @pytest.mark.parametrize("bad_task", ["", "   "])
