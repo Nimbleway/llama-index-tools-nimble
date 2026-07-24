@@ -107,8 +107,8 @@ it never creates, edits, or deletes agent instances.
 |---|---|---|---|
 | `agent_id` | `str` | — | Preconfigured Web Search Agent instance id (`wsa_...`). |
 | `api_key` | `str \| None` | `None` | Nimble API key; falls back to `NIMBLE_API_KEY`. |
-| `timeout` | `float` | `300.0` | Overall deadline in seconds for one `run` call. |
-| `poll_interval` | `float` | `2.0` | Seconds between status polls. |
+| `timeout` | `float` | `300.0` | Overall deadline in seconds for one `run` call — creation, polling, and result retrieval together. Each HTTP request is bounded by the budget left when it is issued (with a 5 s connect ceiling), so a stalled request cannot fall back to the SDK's much longer default. |
+| `poll_interval` | `float` | `2.0` | Seconds between status polls, and the pause before re-attempting a transient failure. |
 
 ### `run(task, effort="medium")`
 
@@ -142,7 +142,9 @@ A run that does not produce a result raises a typed error that retains the `run_
 | `NimbleAgentProtocolError` | Unknown status, malformed result, or persistent polling/result errors (SDK exception chained). |
 
 SDK errors raised before a run exists (e.g. an invalid key → `AuthenticationError`)
-propagate unchanged. A runnable agent workflow is in
+propagate unchanged. Transient failures — transport errors, 408, 429, 5xx — are re-attempted
+within the remaining budget (respecting `Retry-After`); auth, permission, and validation
+errors fail fast. A runnable agent workflow is in
 [`examples/nimble_agent_api.py`](examples/nimble_agent_api.py).
 
 ## License

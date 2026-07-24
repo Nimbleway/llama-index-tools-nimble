@@ -2,6 +2,9 @@
 
 import json
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from random import random
 from typing import Any, Literal, get_args
 
 from llama_index.core.schema import Document
@@ -10,7 +13,9 @@ from llama_index.core.tools.tool_spec.base import BaseToolSpec
 # Exception and response-model types are imported eagerly — they must be
 # resolvable in `except` clauses and annotations. Only the client class is
 # imported lazily (in __init__) so tests can monkeypatch nimble_python.Nimble.
-from nimble_python import APIError
+# `Timeout` is the SDK's re-export of httpx's, so per-phase request timeouts
+# need no dependency this package does not already have.
+from nimble_python import APIConnectionError, APIError, APIStatusError, Timeout
 from nimble_python.types.agents.run_create_response import RunCreateResponse
 from nimble_python.types.agents.run_get_response import RunGetResponse
 from nimble_python.types.agents.run_result_response import TaskRunResultPublicV2
@@ -34,6 +39,73 @@ _RunState = RunCreateResponse | RunGetResponse
 
 # Same attribution value the search tool sends; keep the two in sync.
 _CLIENT_SOURCE = "llama-index-tools-nimble"
+
+# Floor for a per-request timeout, so a nearly-exhausted budget still yields a
+# positive value the HTTP client accepts (it then times out immediately).
+_MIN_REQUEST_TIMEOUT = 0.001
+
+# Connect ceiling: a black-holed connection should fail fast rather than spend
+# the whole remaining budget (mirrors the SDK's own 5 s connect default).
+_CONNECT_TIMEOUT = 5.0
+
+# Retry pacing, matching what the SDK applies when its retry loop is enabled.
+_MAX_RETRY_DELAY = 8.0
+_MAX_RETRY_AFTER = 60.0
+
+# Attempt ceilings, so the deadline is never the only thing bounding request
+# volume. Creating a run is capped hardest: it is a non-idempotent POST.
+_MAX_CREATE_ATTEMPTS = 3
+_MAX_ATTEMPTS = 5
+
+_RETRYABLE_STATUSES: tuple[int, ...] = (408, 429)
+
+
+def _retry_after_seconds(exc: APIError) -> float | None:
+    """Seconds the server asked us to wait, in either documented form."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    milliseconds = headers.get("retry-after-ms")
+    if milliseconds:
+        try:
+            return float(milliseconds) / 1000
+        except ValueError:
+            pass
+    header = headers.get("retry-after")
+    if not header:
+        return None
+    try:
+        return float(header)
+    except ValueError:
+        pass
+    try:  # HTTP-date form
+        parsed = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    return (parsed - datetime.now(parsed.tzinfo or timezone.utc)).total_seconds()
+
+
+def _is_retryable(exc: APIError, *, allow_conflict: bool = False) -> bool:
+    """Whether another attempt is worthwhile, budget permitting.
+
+    ``allow_conflict`` covers the one place a 409 is plausibly transient: the
+    read-after-write window between a run reporting ``completed`` and its
+    result becoming readable. Everywhere else a 409 means "still active",
+    which contradicts what we just observed and is not worth re-attempting.
+    """
+    if isinstance(exc, APIConnectionError):  # includes APITimeoutError
+        return True
+    if not isinstance(exc, APIStatusError):
+        return False
+    # The server's own instruction wins in both directions, as in the SDK.
+    should_retry = exc.response.headers.get("x-should-retry")
+    if should_retry == "true":
+        return True
+    if should_retry == "false":
+        return False
+    if allow_conflict and exc.status_code == 409:
+        return True
+    return exc.status_code in _RETRYABLE_STATUSES or exc.status_code >= 500
 
 
 class NimbleAgentToolSpec(BaseToolSpec):
@@ -67,12 +139,20 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 (format ``wsa_<uuid>``) that runs will execute on.
             api_key: Nimble API key. If omitted, the SDK reads
                 ``NIMBLE_API_KEY`` from the environment.
-            timeout: Overall deadline in seconds for one ``run`` call
-                (creation + polling). Runs still executing at the deadline
-                raise :class:`NimbleAgentTimeoutError` client-side; the
-                server-side run is not cancelled and can be fetched later
-                via its ``run_id``.
-            poll_interval: Seconds between status polls.
+            timeout: Overall deadline in seconds for one ``run`` call,
+                covering creation, polling, and result retrieval. Every HTTP
+                request is bounded by the budget left at the moment it is
+                issued, so a stalled request cannot spend the SDK's own
+                (much longer) default. Under pathological transport
+                conditions a single request's connect, read, and write
+                phases can each consume that budget, so treat this as a
+                tight bound rather than a hard ceiling. Runs still
+                executing at the deadline raise
+                :class:`NimbleAgentTimeoutError` client-side; the server-side
+                run is not cancelled and can be fetched later via its
+                ``run_id``.
+            poll_interval: Seconds between status polls, and the pause before
+                re-attempting a transient failure.
         """
         if not agent_id or not agent_id.strip():
             raise ValueError("agent_id must be a non-empty string")
@@ -86,10 +166,16 @@ class NimbleAgentToolSpec(BaseToolSpec):
         # The key is handed straight to the SDK client and deliberately not
         # kept on the spec: nothing in results, metadata, or errors should
         # ever be able to echo it.
+        #
+        # Retries are disabled on the client because this tool owns them: the
+        # SDK's own retry loop would issue up to three requests, each with its
+        # own timeout, and could outlive the overall deadline several times
+        # over. The poll and result loops re-attempt transient failures
+        # themselves, always inside the remaining budget.
         self.client = Nimble(
             api_key=api_key,
             default_headers={"X-Client-Source": _CLIENT_SOURCE},
-        )
+        ).with_options(max_retries=0)
         self.agent_id = agent_id
         self.timeout = float(timeout)
         self.poll_interval = float(poll_interval)
@@ -127,26 +213,26 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 ``cancelled``.
             NimbleAgentProtocolError: The API returned an unknown status or
                 a malformed result, or polling/result requests kept failing.
+
+        A failure to even start the run raises the underlying SDK exception
+        unchanged (for example ``AuthenticationError`` on a bad key): no run
+        exists yet, so there is no ``run_id`` to attach.
         """
         if not task or not task.strip():
             raise ValueError("task must be a non-empty string")
         if effort not in _EFFORT_LEVELS:
             raise ValueError(f"effort must be one of {_EFFORT_LEVELS}, got {effort!r}")
 
-        # SDK errors here (401/403/422/429/...) propagate unwrapped: no run
-        # exists yet, so there is no run_id to retain, and the SDK exception
-        # is the most informative thing to surface.
-        created = self.client.agents.runs.create(
-            self.agent_id,
-            input=task,
-            effort=effort,
-        )
+        # One budget covers the whole call: creation, polling, and result
+        # retrieval all draw from this deadline.
+        deadline = time.monotonic() + self.timeout
 
-        run_state = self._poll_until_terminal(created)
+        created = self._create_run(task, effort, deadline)
+        run_state = self._poll_until_terminal(created, deadline)
         status = run_state.status
 
         if status == "completed":
-            result = self._fetch_result(run_state.id)
+            result = self._fetch_result(run_state.id, deadline)
             return self._to_document(result)
         if status == "failed":
             detail = self._run_error_message(run_state) or "no error detail provided"
@@ -178,16 +264,65 @@ class NimbleAgentToolSpec(BaseToolSpec):
             status=status,
         )
 
-    def _poll_until_terminal(self, created: _RunState) -> _RunState:
+    def _request_timeout(self, deadline: float) -> Timeout:
+        """Budget left for one request, as a per-phase HTTP timeout.
+
+        A bare float would give connect, read, write, and pool that budget
+        *each*; keeping a tight connect ceiling means a black-holed TCP
+        connection fails fast instead of consuming the whole allowance.
+        """
+        remaining = max(deadline - time.monotonic(), _MIN_REQUEST_TIMEOUT)
+        return Timeout(remaining, connect=min(_CONNECT_TIMEOUT, remaining))
+
+    def _retry_delay(self, exc: APIError, attempt: int, remaining: float) -> float:
+        """How long to wait before re-attempting, never past the deadline.
+
+        Mirrors the retry pacing the SDK applies when its own retry loop is
+        enabled: honor a usable ``Retry-After``, otherwise back off
+        exponentially with jitter so simultaneous clients do not retry in
+        lockstep during an incident.
+        """
+        retry_after = _retry_after_seconds(exc)
+        if retry_after is not None and 0 < retry_after <= _MAX_RETRY_AFTER:
+            return min(retry_after, remaining)
+        backoff = min(self.poll_interval * 2 ** (attempt - 1), _MAX_RETRY_DELAY)
+        return min(backoff * (1 - 0.25 * random()), remaining)
+
+    def _create_run(
+        self, task: str, effort: EffortLevel, deadline: float
+    ) -> RunCreateResponse:
+        """Start the run, bounded by the overall deadline.
+
+        Creating a run is a non-idempotent POST that provisions billable
+        server-side work, and a failure gives no run id to reconcile with, so
+        attempts are capped rather than left to fill the budget: a proxy that
+        fails *after* the backend accepted the request would otherwise leave a
+        trail of orphaned runs. SDK errors propagate unwrapped — no run exists
+        yet, so the SDK exception is the most informative thing to surface.
+        """
+        for attempt in range(1, _MAX_CREATE_ATTEMPTS + 1):
+            try:
+                return self.client.agents.runs.create(
+                    self.agent_id,
+                    input=task,
+                    effort=effort,
+                    timeout=self._request_timeout(deadline),
+                )
+            except APIError as exc:
+                remaining = deadline - time.monotonic()
+                last = attempt == _MAX_CREATE_ATTEMPTS
+                if last or not _is_retryable(exc) or remaining <= 0:
+                    raise
+                time.sleep(self._retry_delay(exc, attempt, remaining))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _poll_until_terminal(self, created: _RunState, deadline: float) -> _RunState:
         """Poll the run until a documented terminal status or the deadline.
 
-        Uses a monotonic-clock deadline (not an attempt count) so the overall
-        budget holds regardless of per-request latency. Transient transport
-        and retryable HTTP failures are already retried inside the SDK; an
-        error that still escapes it is surfaced as a protocol error carrying
-        the run id.
+        Uses a monotonic-clock deadline (not an attempt count), and passes the
+        remaining budget as each request's timeout, so neither a slow response
+        nor a stalled connection can push the call past the deadline.
         """
-        deadline = time.monotonic() + self.timeout
         run_state = created
         while True:
             status = run_state.status
@@ -202,46 +337,67 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise NimbleAgentTimeoutError(
-                    f"run still {status} after {self.timeout:.0f}s; "
-                    "it may still complete server-side",
-                    run_id=run_state.id,
-                    agent_id=self.agent_id,
-                    status=status,
-                )
+                raise self._timeout_error(run_state.id, status)
             time.sleep(min(self.poll_interval, remaining))
+            run_state = self._get_run(run_state.id, deadline, status)
+
+    def _get_run(
+        self, run_id: str, deadline: float, last_status: str
+    ) -> RunGetResponse:
+        """Fetch current run state, re-attempting transients within budget."""
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                run_state = self.client.agents.runs.get(
-                    run_state.id,
+                return self.client.agents.runs.get(
+                    run_id,
                     agent_id=self.agent_id,
+                    timeout=self._request_timeout(deadline),
                 )
             except APIError as exc:
-                raise NimbleAgentProtocolError(
-                    f"polling failed ({type(exc).__name__}: {exc})",
-                    run_id=run_state.id,
-                    agent_id=self.agent_id,
-                    status=status,
-                ) from exc
+                remaining = deadline - time.monotonic()
+                if not _is_retryable(exc) or attempt == _MAX_ATTEMPTS:
+                    raise NimbleAgentProtocolError(
+                        f"polling failed ({type(exc).__name__}: {exc})",
+                        run_id=run_id,
+                        agent_id=self.agent_id,
+                        status=last_status,
+                    ) from exc
+                if remaining <= 0:
+                    raise self._timeout_error(run_id, last_status) from exc
+                time.sleep(self._retry_delay(exc, attempt, remaining))
+        raise AssertionError("unreachable")  # pragma: no cover
 
-    def _fetch_result(self, run_id: str) -> TaskRunResultPublicV2:
+    def _fetch_result(self, run_id: str, deadline: float) -> TaskRunResultPublicV2:
         """Fetch the result of a completed run and validate its shape.
 
         Only called after observing ``completed``: fetching earlier is a 409
         by contract, and failed/cancelled runs answer 422 — their error
-        detail is already on the polled run object.
+        detail is already on the polled run object. Like polling, each request
+        is bounded by the budget left and transients are re-attempted inside
+        it.
         """
-        try:
-            result = self.client.agents.runs.result(
-                run_id,
-                agent_id=self.agent_id,
-            )
-        except APIError as exc:
-            raise NimbleAgentProtocolError(
-                f"result fetch failed ({type(exc).__name__}: {exc})",
-                run_id=run_id,
-                agent_id=self.agent_id,
-                status="completed",
-            ) from exc
+        result = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                result = self.client.agents.runs.result(
+                    run_id,
+                    agent_id=self.agent_id,
+                    timeout=self._request_timeout(deadline),
+                )
+                break
+            except APIError as exc:
+                remaining = deadline - time.monotonic()
+                retryable = _is_retryable(exc, allow_conflict=True)
+                if not retryable or attempt == _MAX_ATTEMPTS:
+                    raise NimbleAgentProtocolError(
+                        f"result fetch failed ({type(exc).__name__}: {exc})",
+                        run_id=run_id,
+                        agent_id=self.agent_id,
+                        status="completed",
+                    ) from exc
+                if remaining <= 0:
+                    raise self._timeout_error(run_id, "completed") from exc
+                time.sleep(self._retry_delay(exc, attempt, remaining))
+        assert result is not None  # loop either returns a result or raises
 
         # The result union also has a failed variant (no `output`). A
         # completed run must carry an output payload; anything else is a
@@ -313,6 +469,27 @@ class NimbleAgentToolSpec(BaseToolSpec):
             "claims": [self._dump(claim) for claim in claims],
         }
         return Document(text=text, extra_info=metadata)
+
+    def _timeout_error(self, run_id: str, status: str) -> NimbleAgentTimeoutError:
+        """The timeout message, phrased for where the budget ran out."""
+        if status == "completed":
+            # The run finished; only fetching its output ran out of time, so
+            # "may still complete server-side" would be nonsense here.
+            message = (
+                f"run completed but its result could not be fetched "
+                f"within {self.timeout:.0f}s; it can be fetched later"
+            )
+        else:
+            message = (
+                f"run still {status} after {self.timeout:.0f}s; "
+                "it may still complete server-side"
+            )
+        return NimbleAgentTimeoutError(
+            message,
+            run_id=run_id,
+            agent_id=self.agent_id,
+            status=status,
+        )
 
     @staticmethod
     def _run_error_message(run_state: _RunState) -> str | None:

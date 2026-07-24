@@ -6,12 +6,13 @@ wire-shaped payloads, ``model_construct`` to smuggle in contract-violating
 states), so the mapping is exercised against the SDK's actual model layer.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import httpx
 import pytest
 from llama_index.core.schema import Document
 from nimble_python import (
+    APITimeoutError,
     AuthenticationError,
     ConflictError,
     InternalServerError,
@@ -147,6 +148,9 @@ def _spec(monkeypatch, api_key="test-key", timeout=300.0, poll_interval=2.0):
     import nimble_python
 
     client = MagicMock()
+    # The spec calls .with_options(max_retries=0); the real SDK returns an
+    # equivalent client, so the mock returns itself.
+    client.with_options.return_value = client
     captured_kwargs = {}
 
     def _fake_nimble(**kwargs):
@@ -180,11 +184,15 @@ class _FakeClock:
 
 @pytest.fixture
 def fake_clock(monkeypatch):
+    """Deterministic time *and* jitter, so sleep schedules are exact."""
     from llama_index.tools.nimble import agent as agent_module
 
     clock = _FakeClock()
     monkeypatch.setattr(agent_module.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(agent_module.time, "sleep", clock.sleep)
+    # Back-off jitter is 1 - 0.25 * random(); pin random() to 0 so the
+    # jittered delay is exactly the computed back-off.
+    monkeypatch.setattr(agent_module, "random", lambda: 0.0)
     return clock
 
 
@@ -200,11 +208,13 @@ def test_full_lifecycle_queued_running_completed(monkeypatch, fake_clock):
     doc = spec.run("research task")
 
     client.agents.runs.create.assert_called_once_with(
-        AGENT_ID, input="research task", effort="medium"
+        AGENT_ID, input="research task", effort="medium", timeout=ANY
     )
-    client.agents.runs.get.assert_called_with(RUN_ID, agent_id=AGENT_ID)
+    client.agents.runs.get.assert_called_with(RUN_ID, agent_id=AGENT_ID, timeout=ANY)
     assert client.agents.runs.get.call_count == 2
-    client.agents.runs.result.assert_called_once_with(RUN_ID, agent_id=AGENT_ID)
+    client.agents.runs.result.assert_called_once_with(
+        RUN_ID, agent_id=AGENT_ID, timeout=ANY
+    )
     assert isinstance(doc, Document)
     assert doc.text.startswith("The final answer.")
 
@@ -228,7 +238,7 @@ def test_effort_passes_through_to_create(monkeypatch, fake_clock):
     spec.run("task", effort="x-high")
 
     client.agents.runs.create.assert_called_once_with(
-        AGENT_ID, input="task", effort="x-high"
+        AGENT_ID, input="task", effort="x-high", timeout=ANY
     )
 
 
@@ -367,15 +377,13 @@ def test_conflict_on_result_is_protocol_error_with_cause(monkeypatch, fake_clock
         (PermissionDeniedError, 403),
         (NotFoundError, 404),
         (UnprocessableEntityError, 422),
-        (RateLimitError, 429),
-        (InternalServerError, 500),
     ],
 )
-def test_api_error_while_polling_is_wrapped(
+def test_non_retryable_error_while_polling_is_wrapped(
     monkeypatch, fake_clock, error_cls, status_code
 ):
-    # The contract's full HTTP-status list: whatever escapes the SDK's own
-    # retry layer during polling wraps to a protocol error retaining run_id.
+    # Auth/permission/validation failures are terminal: wrap immediately as a
+    # protocol error retaining run_id, never spend the budget re-attempting.
     spec, client, _ = _spec(monkeypatch)
     client.agents.runs.create.return_value = _created("queued")
     client.agents.runs.get.side_effect = _api_error(error_cls, status_code)
@@ -385,6 +393,32 @@ def test_api_error_while_polling_is_wrapped(
 
     assert excinfo.value.run_id == RUN_ID
     assert isinstance(excinfo.value.__cause__, error_cls)
+    assert client.agents.runs.get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("error_cls", "status_code"),
+    [
+        (RateLimitError, 429),
+        (InternalServerError, 500),
+    ],
+)
+def test_transient_error_while_polling_is_absorbed_then_bounded(
+    monkeypatch, fake_clock, error_cls, status_code
+):
+    # Transients are re-attempted (the SDK's own retry loop is disabled, so
+    # this tool owns them) but only inside the deadline — never past it.
+    spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.side_effect = _api_error(error_cls, status_code)
+
+    with pytest.raises(NimbleAgentTimeoutError) as excinfo:
+        spec.run("task")
+
+    assert excinfo.value.run_id == RUN_ID
+    assert isinstance(excinfo.value.__cause__, error_cls)
+    assert client.agents.runs.get.call_count > 1  # genuinely re-attempted
+    assert fake_clock.now <= 10.0  # and still inside the configured bound
 
 
 def test_auth_error_on_create_propagates_unwrapped(monkeypatch, fake_clock):
@@ -395,6 +429,304 @@ def test_auth_error_on_create_propagates_unwrapped(monkeypatch, fake_clock):
 
     with pytest.raises(AuthenticationError):
         spec.run("task")
+
+
+# ------------------------------------------------------- deadline bounding
+
+
+def _stalling(fake_clock):
+    """A call that hangs for exactly the timeout it was given, then fails.
+
+    This is what an HTTP client does with a stalled request: block for the
+    per-request timeout, then raise. Driving the fake clock by the *passed*
+    timeout is what makes these tests discriminating — if the tool stopped
+    passing the remaining budget, the stall would fall back to the SDK's own
+    per-request timeout and overrun the bound.
+    """
+
+    def _call(*args, timeout, **kwargs):
+        # httpx blocks for the read phase of the budget it was handed.
+        fake_clock.now += timeout.read
+        raise APITimeoutError(request=httpx.Request("GET", "https://api.test/v2"))
+
+    return _call
+
+
+def test_stalled_create_cannot_outlive_the_deadline(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
+    client.agents.runs.create.side_effect = _stalling(fake_clock)
+
+    # No run exists yet, so the SDK error surfaces unwrapped (existing
+    # contract) — the point here is that it happens *within* the bound.
+    with pytest.raises(APITimeoutError):
+        spec.run("task")
+
+    assert fake_clock.now <= 10.0
+
+
+def test_stalled_poll_cannot_outlive_the_deadline(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.side_effect = _stalling(fake_clock)
+
+    with pytest.raises(NimbleAgentTimeoutError) as excinfo:
+        spec.run("task")
+
+    assert excinfo.value.run_id == RUN_ID
+    assert isinstance(excinfo.value.__cause__, APITimeoutError)
+    # The whole call — create, sleep, and the stalled poll — fits the bound.
+    assert fake_clock.now <= 10.0
+    client.agents.runs.result.assert_not_called()
+
+
+def test_stalled_result_cannot_outlive_the_deadline(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.side_effect = _stalling(fake_clock)
+
+    with pytest.raises(NimbleAgentTimeoutError) as excinfo:
+        spec.run("task")
+
+    assert excinfo.value.run_id == RUN_ID
+    assert excinfo.value.status == "completed"
+    assert fake_clock.now <= 10.0
+
+
+def test_every_request_carries_the_remaining_budget(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.return_value = _run("completed")
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    # create at t=0 → 10s left; get after one 2s sleep → 8s; result → 8s.
+    assert client.agents.runs.create.call_args.kwargs["timeout"].read == pytest.approx(
+        10.0
+    )
+    assert client.agents.runs.get.call_args.kwargs["timeout"].read == pytest.approx(8.0)
+    assert client.agents.runs.result.call_args.kwargs["timeout"].read == pytest.approx(
+        8.0
+    )
+
+
+def test_request_timeout_never_goes_non_positive(monkeypatch, fake_clock):
+    # A budget consumed to the millisecond must still yield a timeout the
+    # HTTP client accepts (it then fails fast) rather than 0 or negative.
+    spec, client, _ = _spec(monkeypatch, timeout=4.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.side_effect = _stalling(fake_clock)
+
+    with pytest.raises(NimbleAgentTimeoutError):
+        spec.run("task")
+
+    for call in client.agents.runs.get.call_args_list:
+        assert call.kwargs["timeout"].read > 0
+        assert call.kwargs["timeout"].connect > 0
+
+
+def test_retry_after_is_honored_within_the_budget(monkeypatch, fake_clock):
+    # The SDK honored Retry-After before its retry loop was disabled here;
+    # a rate-limited caller must still back off as the server asks.
+    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    throttled = httpx.Response(429, request=request, headers={"retry-after": "9"})
+    client.agents.runs.get.side_effect = [
+        RateLimitError("slow down", response=throttled, body=None),
+        _run("completed"),
+    ]
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    # 2s poll interval, then a 9s back-off as instructed (not another 2s).
+    assert fake_clock.sleeps == [2.0, 9.0]
+
+
+def test_retry_after_is_clamped_to_the_remaining_budget(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=6.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    throttled = httpx.Response(429, request=request, headers={"retry-after": "30"})
+    client.agents.runs.get.side_effect = RateLimitError(
+        "slow down", response=throttled, body=None
+    )
+
+    with pytest.raises(NimbleAgentTimeoutError):
+        spec.run("task")
+
+    # 2s poll interval, then the 30s the server asked for, clamped to the 4s
+    # actually left — a fixed-interval retry would have slept [2, 2, 2].
+    assert fake_clock.sleeps == [2.0, 4.0]
+    assert fake_clock.now == 6.0
+
+
+def test_implausible_retry_after_falls_back_to_backoff(monkeypatch, fake_clock):
+    # The SDK ignored a Retry-After above 60s rather than trusting it; a
+    # server (or proxy) asking for 10 minutes must not park the caller.
+    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    throttled = httpx.Response(429, request=request, headers={"retry-after": "600"})
+    client.agents.runs.get.side_effect = [
+        RateLimitError("slow down", response=throttled, body=None),
+        _run("completed"),
+    ]
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    assert fake_clock.sleeps == [2.0, 2.0]  # back-off, not 600s
+
+
+def test_create_retries_a_transient_failure_then_succeeds(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
+    client.agents.runs.create.side_effect = [
+        _api_error(InternalServerError, 500),
+        _created("completed"),
+    ]
+    client.agents.runs.result.return_value = _text_result()
+
+    doc = spec.run("task")
+
+    assert client.agents.runs.create.call_count == 2
+    assert doc.text.startswith("The final answer.")
+
+
+def test_malformed_retry_after_falls_back_to_poll_interval(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    # HTTP-date form: valid HTTP, not a float — must not crash the poller.
+    throttled = httpx.Response(
+        429, request=request, headers={"retry-after": "Wed, 23 Jul 2026 12:00:00 GMT"}
+    )
+    client.agents.runs.get.side_effect = [
+        RateLimitError("slow down", response=throttled, body=None),
+        _run("completed"),
+    ]
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    assert fake_clock.sleeps == [2.0, 2.0]
+
+
+def test_sdk_internal_retries_are_disabled(monkeypatch):
+    # The SDK's own retry loop would issue several requests per call, each
+    # with its own timeout, and could outlive the overall deadline; this tool
+    # owns retries instead.
+    _, client, _ = _spec(monkeypatch)
+    client.with_options.assert_called_once_with(max_retries=0)
+
+
+def test_create_attempts_are_capped(monkeypatch, fake_clock):
+    """Creating a run is a non-idempotent POST — never retried for the budget.
+
+    A proxy that fails after the backend accepted the request would leave an
+    orphaned billable run behind, and a failed create surfaces no run id to
+    reconcile with, so attempts are capped well below the deadline.
+    """
+    spec, client, _ = _spec(monkeypatch, timeout=300.0, poll_interval=2.0)
+    client.agents.runs.create.side_effect = _api_error(InternalServerError, 500)
+
+    with pytest.raises(InternalServerError):
+        spec.run("task")
+
+    assert client.agents.runs.create.call_count == 3
+    assert fake_clock.now < 300.0  # gave up long before the budget
+
+
+def test_poll_attempts_are_capped(monkeypatch, fake_clock):
+    # A persistently failing endpoint must not be re-hit for the whole budget.
+    spec, client, _ = _spec(monkeypatch, timeout=300.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.side_effect = _api_error(InternalServerError, 500)
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert client.agents.runs.get.call_count == 5
+    assert excinfo.value.run_id == RUN_ID
+    assert fake_clock.now < 300.0
+
+
+def test_backoff_is_exponential_and_capped(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=300.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.side_effect = _api_error(InternalServerError, 500)
+
+    with pytest.raises(NimbleAgentProtocolError):
+        spec.run("task")
+
+    # first the 2s poll interval, then 2, 4, 8, 8 — doubling, capped at 8.
+    assert fake_clock.sleeps == [2.0, 2.0, 4.0, 8.0, 8.0]
+
+
+def test_server_can_veto_a_retry_with_x_should_retry(monkeypatch, fake_clock):
+    # A 500 is normally retryable; the server's explicit "false" wins.
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    response = httpx.Response(500, request=request, headers={"x-should-retry": "false"})
+    client.agents.runs.get.side_effect = InternalServerError(
+        "no retry", response=response, body=None
+    )
+
+    with pytest.raises(NimbleAgentProtocolError):
+        spec.run("task")
+
+    assert client.agents.runs.get.call_count == 1
+
+
+def test_conflict_on_result_is_retried_then_reported(monkeypatch, fake_clock):
+    """A 409 in the read-after-write window is worth one more look.
+
+    Discarding the output of a multi-minute billable run because its result
+    was not readable on the first attempt is the expensive mistake here.
+    """
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.side_effect = [
+        _api_error(ConflictError, 409),
+        _text_result(),
+    ]
+
+    doc = spec.run("task")
+
+    assert client.agents.runs.result.call_count == 2
+    assert doc.text.startswith("The final answer.")
+
+
+def test_retry_after_ms_is_honored(monkeypatch, fake_clock):
+    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
+    client.agents.runs.create.return_value = _created("queued")
+    request = httpx.Request("GET", "https://api.test/v2")
+    throttled = httpx.Response(429, request=request, headers={"retry-after-ms": "4500"})
+    client.agents.runs.get.side_effect = [
+        RateLimitError("slow down", response=throttled, body=None),
+        _run("completed"),
+    ]
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    assert fake_clock.sleeps == [2.0, 4.5]
+
+
+def test_request_timeout_keeps_a_tight_connect_ceiling(monkeypatch, fake_clock):
+    # A bare float would give every phase the whole budget; a black-holed
+    # connection must fail fast instead.
+    spec, client, _ = _spec(monkeypatch, timeout=300.0)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    sent = client.agents.runs.create.call_args.kwargs["timeout"]
+    assert sent.read == pytest.approx(300.0)
+    assert sent.connect == pytest.approx(5.0)
 
 
 # ---------------------------------------------------------------- mapping
@@ -705,3 +1037,55 @@ def test_real_client_binds_real_sdk_signatures(monkeypatch, fake_clock):
         ("GET", f"/v2/agents/{AGENT_ID}/runs/{RUN_ID}/result"),
     ]
     assert all(header == "llama-index-tools-nimble" for _, _, header in seen)
+
+
+def test_remaining_budget_reaches_the_wire(monkeypatch, fake_clock):
+    """The deadline is enforced by the HTTP client, not just by our arithmetic.
+
+    Drives the real Nimble client over a mocked transport and reads the
+    timeout httpx actually resolved for each outgoing request, proving the
+    remaining budget is what bounds every call — the guarantee the tool's
+    `timeout` argument advertises.
+    """
+    import nimble_python
+    from nimble_python import Nimble as RealNimble
+
+    read_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        read_timeouts.append(request.extensions["timeout"]["read"])
+        if request.method == "POST":
+            return httpx.Response(202, json=_run_payload("queued"))
+        if request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                json={
+                    "run": _run_payload("completed"),
+                    "output": {
+                        "type": "text",
+                        "content": "bounded",
+                        "trust": _trust_payload(),
+                    },
+                },
+            )
+        return httpx.Response(200, json=_run_payload("completed"))
+
+    def _fake(**kwargs):
+        return RealNimble(
+            **kwargs,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    monkeypatch.setattr(nimble_python, "Nimble", _fake)
+    spec = NimbleAgentToolSpec(
+        agent_id=AGENT_ID, api_key="test-key", timeout=30.0, poll_interval=2.0
+    )
+
+    spec.run("bounded task")
+
+    # create at t=0 → 30s left; one 2s poll interval elapses before the poll
+    # and the result fetch, so both are bounded by the 28s that remain.
+    assert read_timeouts == pytest.approx([30.0, 28.0, 28.0])
+    # …and the client actually used is the retry-disabled one, not just a
+    # discarded copy (asserting on the real object, not the mock's call log).
+    assert spec.client.max_retries == 0

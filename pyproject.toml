@@ -44,6 +44,7 @@ include = ["llama_index/"]
 test = [
     "pytest>=7.3.0,<9.0.0",
     "pytest-mock>=3.10.0,<4.0.0",
+    "pytest-timeout>=2.1.0,<3.0.0",
 ]
 lint = [
     "ruff>=0.9",
@@ -72,4 +73,4 @@ select = ["E", "F", "I", "UP", "B", "W"]
 "examples/**/*.py" = ["T201", "D"]
 
 [tool.pytest.ini_options]
-addopts = "--strict-markers --strict-config"
+addopts = "--strict-markers --strict-config --timeout=60"
