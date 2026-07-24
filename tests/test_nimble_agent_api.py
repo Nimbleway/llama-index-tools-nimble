@@ -6,6 +6,7 @@ wire-shaped payloads, ``model_construct`` to smuggle in contract-violating
 states), so the mapping is exercised against the SDK's actual model layer.
 """
 
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import httpx
@@ -792,6 +793,43 @@ def test_source_without_title_renders_bare_url(monkeypatch, fake_clock):
     doc = spec.run("task")
 
     assert "- https://example.org/no-title (secondary)" in doc.text
+
+
+def test_completed_run_without_trust_is_protocol_error(monkeypatch, fake_clock):
+    # A completed result whose output carries no trust block is a contract
+    # violation: it must surface as a typed protocol error retaining run
+    # context, never a bare AttributeError from dereferencing trust.
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    trustless = TaskRunResultPublicV2.model_construct(
+        run=RunGetResponse.model_validate(_run_payload("completed")),
+        output=SimpleNamespace(content="answer", trust=None),
+    )
+    client.agents.runs.result.return_value = trustless
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert excinfo.value.run_id == RUN_ID
+    assert "no output payload" in str(excinfo.value)
+
+
+def test_empty_content_without_sources_still_yields_non_empty_text(
+    monkeypatch, fake_clock
+):
+    # A run can complete with blank content and no sources; the Document must
+    # never have empty text (which breaks downstream nodes), and the fallback
+    # keeps the run id so the result stays traceable.
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result(
+        content="   ", sources=[], claims=[]
+    )
+
+    doc = spec.run("task")
+
+    assert doc.text.strip()
+    assert RUN_ID in doc.text
 
 
 def test_output_maps_correctly_when_type_tag_is_absent(monkeypatch, fake_clock):

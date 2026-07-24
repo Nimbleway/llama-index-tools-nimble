@@ -400,12 +400,18 @@ class NimbleAgentToolSpec(BaseToolSpec):
         assert result is not None  # loop either returns a result or raises
 
         # The result union also has a failed variant (no `output`). A
-        # completed run must carry an output payload; anything else is a
-        # contract violation, not a mappable answer.
+        # completed run must carry an output payload with its trust block
+        # (both are required by the schema, but a lenient or future SDK could
+        # hand back a partial one); anything else is a contract violation, not
+        # a mappable answer. Validating trust here keeps `_to_document`'s
+        # `output.trust.*` dereferences from raising a bare AttributeError
+        # instead of the typed, run-context-carrying protocol error.
+        output = getattr(result, "output", None)
         if (
             not isinstance(result, TaskRunResultPublicV2)
-            or getattr(result, "output", None) is None
-            or getattr(result.output, "content", None) is None
+            or output is None
+            or getattr(output, "content", None) is None
+            or getattr(output, "trust", None) is None
         ):
             raise NimbleAgentProtocolError(
                 "completed run returned no output payload",
@@ -457,6 +463,13 @@ class NimbleAgentToolSpec(BaseToolSpec):
                     label += f" ({source_type})"
                 lines.append(f"- {label}")
             text += "\n\nSources:\n" + "\n".join(lines)
+
+        # Never emit an empty Document: a run can complete with empty content
+        # and no sources, and empty `Document.text` can break downstream nodes
+        # (the sibling search tool guards this the same way). Keep the run id
+        # in the fallback so the caller can still trace it.
+        if not text:
+            text = f"Run {run.id} completed with no answer content."
 
         metadata: dict[str, Any] = {
             "run_id": run.id,
