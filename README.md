@@ -158,6 +158,15 @@ idempotency key, so a failure — transport, 409, 429, 5xx — is surfaced rathe
 retried: a retry after a proxy failed downstream of an accepted request would provision a
 second billable run.
 
+That guarantee extends to the caller. When a create failure leaves the outcome ambiguous
+(a timeout, a dropped connection, a 408/409, or a 5xx), a run may be executing server-side
+with no id to address it, so the tool raises `NimbleAgentCreateAmbiguousError` rather than
+the raw SDK exception. Its message says explicitly not to resubmit and how to reconcile —
+important when the caller is a function-calling model, which would otherwise read a bare
+timeout as an ordinary transient and call the tool again. Requests that were definitely
+rejected (bad key, validation, rate limit) still propagate unchanged, since nothing was
+provisioned and calling again is safe.
+
 The returned `Document.text` is the final answer (prose, or pretty-printed JSON when an
 `output_schema` was given) followed by a `Sources:` list, so agents can cite what was
 consulted. `Document.metadata` carries `run_id`, `agent_id` / `web_search_agent_id`,
@@ -175,9 +184,11 @@ A run that does not produce a result raises a typed error that retains the `run_
 | `NimbleAgentRunFailedError` | Run terminated as `failed`; carries the server's error message. |
 | `NimbleAgentRunCancelledError` | Run terminated as `cancelled`. |
 | `NimbleAgentProtocolError` | Unknown status, malformed result, or persistent polling/result errors (SDK exception chained). |
+| `NimbleAgentCreateAmbiguousError` | Creation failed with an undetermined outcome; a billable run may exist with no id. Do not resubmit — reconcile against the account's run history. `run_id` is `None`; `status_code` and the chained SDK exception are retained. |
 
-SDK errors raised before a run exists (e.g. an invalid key → `AuthenticationError`)
-propagate unchanged. Transient failures — transport errors, 408, 429, 5xx — are re-attempted
+SDK errors raised before a run exists propagate unchanged **only when the request was
+definitely rejected** (e.g. an invalid key → `AuthenticationError`); ambiguous outcomes
+become `NimbleAgentCreateAmbiguousError` as described above. Transient failures — transport errors, 408, 429, 5xx — are re-attempted
 within the remaining budget (respecting `Retry-After`); auth, permission, and validation
 errors fail fast. A runnable agent workflow is in
 [`examples/nimble_agent_api.py`](examples/nimble_agent_api.py).

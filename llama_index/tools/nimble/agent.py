@@ -23,6 +23,7 @@ from nimble_python.types.agents.run_get_response import RunGetResponse
 from nimble_python.types.agents.run_result_response import TaskRunResultPublicV2
 
 from llama_index.tools.nimble.errors import (
+    NimbleAgentCreateAmbiguousError,
     NimbleAgentProtocolError,
     NimbleAgentRunCancelledError,
     NimbleAgentRunFailedError,
@@ -80,6 +81,49 @@ _MAX_RETRY_AFTER = 60.0
 _MAX_ATTEMPTS = 5
 
 _RETRYABLE_STATUSES: tuple[int, ...] = (408, 429)
+
+
+def _is_ambiguous_create_failure(exc: APIError) -> bool:
+    """Whether this create failure leaves a run possibly running server-side.
+
+    A different question from :func:`_is_retryable`, which asks whether *we*
+    should try again. Here the question is whether the backend may already
+    have accepted the work, because that is what decides whether the caller
+    is safe to resubmit.
+
+    Ambiguous: transport failures and timeouts (the request may have been
+    delivered and answered into a dead socket), 408 and 409 (the server saw
+    enough to answer about the request), and every 5xx (a proxy commonly
+    fails *after* forwarding to a backend that accepted it).
+
+    Unambiguous: the remaining 4xx — auth, permission, not-found, validation,
+    rate limit. The request was rejected before any run was provisioned, so
+    the caller can safely fix the input and call again.
+    """
+    if isinstance(exc, APIConnectionError):  # includes APITimeoutError
+        return True
+    if not isinstance(exc, APIStatusError):
+        # An SDK error that is neither transport nor a response cannot be
+        # shown to have been rejected; assume the costly possibility.
+        return True
+    return exc.status_code in (408, 409) or exc.status_code >= 500
+
+
+def _ambiguous_create_message(exc: APIError, agent_id: str | None) -> str:
+    """Do-not-resubmit guidance, phrased for a model as much as a human."""
+    where = f"agent {agent_id}" if agent_id else "a newly provisioned agent"
+    return (
+        f"Run creation on {where} failed without a definite outcome "
+        f"({type(exc).__name__}: {exc}). The request may have reached the "
+        "backend, so a billable run may be executing even though this call "
+        "failed, and no run id was returned to address it. "
+        "Do not retry or resubmit this task automatically: a second attempt "
+        "would create a second billable run rather than recovering this one. "
+        "Reconcile first — check the run history for this account (and agent, "
+        "if one was configured) in the Nimble dashboard or via the runs API "
+        "for a run matching this task, and resume from its id. Resubmit only "
+        "after confirming no run was created, or when a human asks you to."
+    )
 
 
 def _gated_effort_message(requested: str | None, *, effective: str | None) -> str:
@@ -338,9 +382,14 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 a malformed result, or polling/result requests kept failing.
 
         A failure to even start the run raises the underlying SDK exception
-        unchanged (for example ``AuthenticationError`` on a bad key): no run
-        exists yet, so there is no ``run_id`` to attach. Creation is never
-        re-attempted — see :meth:`_create_run`.
+        unchanged when the request was definitely rejected (for example
+        ``AuthenticationError`` on a bad key): nothing was provisioned, so
+        calling again after fixing the cause is safe. When the outcome is
+        ambiguous — a timeout, a dropped connection, a 408/409, a 5xx — it
+        raises :class:`NimbleAgentCreateAmbiguousError` instead, because a
+        billable run may be executing with no id to address it. Do not
+        resubmit on that error; reconcile against the account's run history
+        first. Creation is never re-attempted — see :meth:`_create_run`.
         """
         if not task or not task.strip():
             raise ValueError("task must be a non-empty string")
@@ -521,9 +570,16 @@ class NimbleAgentToolSpec(BaseToolSpec):
         would leave an orphaned billable run behind, invisible to this caller
         because a failed create surfaces no run id to reconcile with. So this
         is issued once, and once only — the SDK's own retry loop is disabled
-        in ``__init__`` for the same reason. SDK errors propagate unwrapped:
-        no run exists to attach context to, so the SDK exception is the most
-        informative thing to surface.
+        in ``__init__`` for the same reason.
+
+        That guarantee has to survive leaving this method. A failure whose
+        outcome is ambiguous is re-raised as
+        :class:`NimbleAgentCreateAmbiguousError`, whose message tells the
+        caller — often a function-calling model, which would otherwise read a
+        bare timeout as an ordinary transient — not to resubmit, and how to
+        reconcile instead. Unambiguously rejected requests (auth, validation,
+        rate limit) propagate unwrapped: no run was provisioned, so the SDK
+        exception is both safe and the most informative thing to surface.
 
         Route follows identity: a configured agent uses its own runs
         collection, no agent uses the generic route that provisions one.
@@ -549,14 +605,23 @@ class NimbleAgentToolSpec(BaseToolSpec):
             create_options["skill"] = self.skill
         if self.use_case is not None:
             create_options["use_case"] = self.use_case
-        if self.agent_id is not None:
-            return self.client.agents.runs.create(
-                self.agent_id,
+        try:
+            if self.agent_id is not None:
+                return self.client.agents.runs.create(
+                    self.agent_id,
+                    **create_options,
+                )
+            return self.client.agents.run(
                 **create_options,
             )
-        return self.client.agents.run(
-            **create_options,
-        )
+        except APIError as exc:
+            if not _is_ambiguous_create_failure(exc):
+                raise
+            raise NimbleAgentCreateAmbiguousError(
+                _ambiguous_create_message(exc, self.agent_id),
+                agent_id=self.agent_id,
+                status_code=getattr(exc, "status_code", None),
+            ) from exc
 
     def _poll_until_terminal(
         self, created: _RunState, agent_id: str, deadline: float

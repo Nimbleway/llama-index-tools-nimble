@@ -35,6 +35,7 @@ from nimble_python.types.agents.run_result_response import (
 )
 
 from llama_index.tools.nimble import (
+    NimbleAgentCreateAmbiguousError,
     NimbleAgentProtocolError,
     NimbleAgentRunCancelledError,
     NimbleAgentRunFailedError,
@@ -632,11 +633,13 @@ def test_stalled_create_cannot_outlive_the_deadline(monkeypatch, fake_clock):
     spec, client, _ = _spec(monkeypatch, timeout=10.0, poll_interval=2.0)
     client.agents.runs.create.side_effect = _stalling(fake_clock)
 
-    # No run exists yet, so the SDK error surfaces unwrapped (existing
-    # contract) — the point here is that it happens *within* the bound.
-    with pytest.raises(APITimeoutError):
+    # A stalled create is an ambiguous outcome, so it surfaces as the typed
+    # do-not-resubmit error with the SDK timeout chained — the point here is
+    # that it happens *within* the bound.
+    with pytest.raises(NimbleAgentCreateAmbiguousError) as excinfo:
         spec.run("task")
 
+    assert isinstance(excinfo.value.__cause__, APITimeoutError)
     assert fake_clock.now <= 10.0
 
 
@@ -785,21 +788,37 @@ def test_sdk_internal_retries_are_disabled(monkeypatch):
     client.with_options.assert_called_once_with(max_retries=0)
 
 
+def _create_failure(error_cls, status_code):
+    """The SDK exception a failing create would raise."""
+    request = httpx.Request("POST", "https://api.test/v2")
+    if status_code is None:
+        return (
+            APITimeoutError(request=request)
+            if error_cls is APITimeoutError
+            else APIConnectionError(request=request)
+        )
+    return _api_error(error_cls, status_code)
+
+
+# (error, status, ambiguous?) — "ambiguous" means the backend may have
+# accepted the work despite the failure, so resubmitting would double-bill.
+CREATE_FAILURES = [
+    (APITimeoutError, None, True),  # transport failure
+    (APIConnectionError, None, True),  # transport failure
+    (APIStatusError, 408, True),
+    (ConflictError, 409, True),
+    (InternalServerError, 500, True),
+    (InternalServerError, 503, True),
+    (RateLimitError, 429, False),  # rejected outright; nothing provisioned
+    (AuthenticationError, 401, False),
+    (UnprocessableEntityError, 422, False),
+]
+
+
 @pytest.mark.parametrize("agent_id", [AGENT_ID, None])
-@pytest.mark.parametrize(
-    ("error_cls", "status_code"),
-    [
-        (APITimeoutError, None),  # transport failure
-        (APIConnectionError, None),  # transport failure
-        (APIStatusError, 408),
-        (ConflictError, 409),
-        (RateLimitError, 429),
-        (InternalServerError, 500),
-        (InternalServerError, 503),
-    ],
-)
+@pytest.mark.parametrize(("error_cls", "status_code", "ambiguous"), CREATE_FAILURES)
 def test_create_is_never_retried(
-    monkeypatch, fake_clock, error_cls, status_code, agent_id
+    monkeypatch, fake_clock, error_cls, status_code, ambiguous, agent_id
 ):
     """C03 — one POST per run(), whatever the failure, on either route.
 
@@ -812,23 +831,72 @@ def test_create_is_never_retried(
     spec, client, _ = _spec(
         monkeypatch, timeout=300.0, poll_interval=2.0, agent_id=agent_id
     )
-    request = httpx.Request("POST", "https://api.test/v2")
-    if status_code is None:
-        failure = (
-            APITimeoutError(request=request)
-            if error_cls is APITimeoutError
-            else APIConnectionError(request=request)
-        )
-    else:
-        failure = _api_error(error_cls, status_code)
+    failure = _create_failure(error_cls, status_code)
     create = client.agents.runs.create if agent_id else client.agents.run
     create.side_effect = failure
 
-    with pytest.raises(type(failure)):
+    expected = NimbleAgentCreateAmbiguousError if ambiguous else type(failure)
+    with pytest.raises(expected):
         spec.run("task")
 
     assert create.call_count == 1
     assert fake_clock.sleeps == []  # not even a back-off before giving up
+
+
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+@pytest.mark.parametrize(
+    ("error_cls", "status_code", "ambiguous"),
+    [case for case in CREATE_FAILURES if case[2]],
+)
+def test_ambiguous_create_tells_the_caller_not_to_resubmit(
+    monkeypatch, fake_clock, error_cls, status_code, ambiguous, agent_id
+):
+    """The no-duplicate-run guarantee has to survive leaving run().
+
+    This adapter issues one POST, but its caller is often a function-calling
+    model, and a bare APITimeoutError reads to a model like any other
+    transient — it calls the tool again and pays for a second run. The
+    ambiguous outcome therefore surfaces as its own type carrying explicit
+    do-not-resubmit and reconciliation guidance in the message, since the
+    message is usually all a model sees.
+    """
+    spec, client, _ = _spec(monkeypatch, agent_id=agent_id)
+    failure = _create_failure(error_cls, status_code)
+    create = client.agents.runs.create if agent_id else client.agents.run
+    create.side_effect = failure
+
+    with pytest.raises(NimbleAgentCreateAmbiguousError) as excinfo:
+        spec.run("task")
+
+    err = excinfo.value
+    message = str(err)
+    assert "Do not retry or resubmit" in message
+    assert "second billable run" in message
+    assert "run history" in message  # how to reconcile instead
+    # the original cause and status are retained for programmatic callers
+    assert err.__cause__ is failure
+    assert err.status_code == status_code
+    assert type(failure).__name__ in message
+    # no run id exists to address — that absence is the reported problem
+    assert err.run_id is None
+    assert err.agent_id == agent_id
+    assert create.call_count == 1
+
+
+def test_unambiguous_create_rejection_stays_a_plain_sdk_error(monkeypatch, fake_clock):
+    """A definitely-rejected request must not be dressed up as ambiguous.
+
+    Nothing was provisioned on a bad key, so telling the caller to reconcile
+    against run history would send them looking for a run that cannot exist,
+    and discourage the retry that is actually correct after fixing the key.
+    """
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.side_effect = _api_error(AuthenticationError, 401)
+
+    with pytest.raises(AuthenticationError) as excinfo:
+        spec.run("task")
+
+    assert not isinstance(excinfo.value, NimbleAgentCreateAmbiguousError)
 
 
 def test_poll_attempts_are_capped(monkeypatch, fake_clock):
