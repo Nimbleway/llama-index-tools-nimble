@@ -1018,7 +1018,7 @@ wheels = [
 
 [[package]]
 name = "llama-index-tools-nimble"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "llama-index-core" },
@@ -1036,6 +1036,7 @@ lint = [
 test = [
     { name = "pytest" },
     { name = "pytest-mock" },
+    { name = "pytest-timeout" },
 ]
 typing = [
     { name = "mypy" },
@@ -1044,7 +1045,7 @@ typing = [
 [package.metadata]
 requires-dist = [
     { name = "llama-index-core", specifier = ">=0.13.0,<0.15" },
-    { name = "nimble-python", specifier = ">=0.16,<1.0.0" },
+    { name = "nimble-python", specifier = ">=1.2.0,<2.0.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1056,6 +1057,7 @@ lint = [{ name = "ruff", specifier = ">=0.9" }]
 test = [
     { name = "pytest", specifier = ">=7.3.0,<9.0.0" },
     { name = "pytest-mock", specifier = ">=3.10.0,<4.0.0" },
+    { name = "pytest-timeout", specifier = ">=2.1.0,<3.0.0" },
 ]
 typing = [{ name = "mypy", specifier = ">=1.10.0,<2.0.0" }]
 
@@ -1412,7 +1414,7 @@ wheels = [
 
 [[package]]
 name = "nimble-python"
-version = "0.21.0"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1422,9 +1424,9 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/ea/e43b2c50b7b2270a4d609422f87a033b49af2e296aec704130c4606df54e/nimble_python-0.21.0.tar.gz", hash = "sha256:f248e2c40a2debece5eec966a49e71a7484103b87befb9a60259abb4be0f9b69", size = 313210, upload-time = "2026-06-22T14:12:43.164Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/bd/0aab3fe4693997625d88184a468e1a2d84c702c263c987c743fdaad0b96d/nimble_python-1.2.0.tar.gz", hash = "sha256:c79a543399629400bc0acfdee4b8951d03393aef2c6bc8879a3bdca95db84c18", size = 323954, upload-time = "2026-07-28T09:22:11.952Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/0a/217122d588f86856a55c4f708072e051a4dfe3fceefb3820941d8c995542/nimble_python-0.21.0-py3-none-any.whl", hash = "sha256:6e392dcc2daf891792c1bf1491cd9f2a05ae791ab95b1f278ae36c61474f3481", size = 239343, upload-time = "2026-06-22T14:12:41.82Z" },
+    { url = "https://files.pythonhosted.org/packages/38/df/2045d4c3c58a064eabf9870dd80af8cc40f77f4c95fec14b7b7c1d676685/nimble_python-1.2.0-py3-none-any.whl", hash = "sha256:d1e9bf33f73babc0906fc37ad2be14b167d91fc8ebc880e29c18f01ec61883e3", size = 262469, upload-time = "2026-07-28T09:22:13.299Z" },
 ]
 
 [[package]]
@@ -2093,6 +2095,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/68/14/eb014d26be205d38ad5ad20d9a80f7d201472e08167f0bb4361e251084a9/pytest_mock-3.15.1.tar.gz", hash = "sha256:1849a238f6f396da19762269de72cb1814ab44416fa73a8686deac10b0d87a0f", size = 34036, upload-time = "2025-09-16T16:37:27.081Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5a/cc/06253936f4a7fa2e0f48dfe6d851d9c56df896a9ab09ac019d70b760619c/pytest_mock-3.15.1-py3-none-any.whl", hash = "sha256:0a25e2eb88fe5168d535041d09a4529a188176ae608a6d249ee65abc0949630d", size = 10095, upload-time = "2025-09-16T16:37:25.734Z" },
+]
+
+[[package]]
+name = "pytest-timeout"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ac/82/4c9ecabab13363e72d880f2fb504c5f750433b2b6f16e99f4ec21ada284c/pytest_timeout-2.4.0.tar.gz", hash = "sha256:7e68e90b01f9eff71332b25001f85c75495fc4e3a836701876183c4bcfd0540a", size = 17973, upload-time = "2025-05-05T19:44:34.99Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/b6/3127540ecdf1464a00e5a01ee60a1b09175f6913f0644ac748494d9c4b21/pytest_timeout-2.4.0-py3-none-any.whl", hash = "sha256:c42667e5cdadb151aeb5b26d114aff6bdf5a907f176a007a30b940d3d865b5c2", size = 14382, upload-time = "2025-05-05T19:44:33.502Z" },
 ]
 
 [[package]]
