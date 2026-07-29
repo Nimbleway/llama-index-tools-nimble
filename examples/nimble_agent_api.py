@@ -1,15 +1,17 @@
 """Runnable example: a LlamaIndex agent using the Nimble Agent API tool.
 
-The Nimble tool executes deep-research runs on a preconfigured Web Search
-Agent; the LlamaIndex agent decides when to call it and relays the
-citation-backed answer. Agent runs are long-running (tens of seconds at low
-effort, minutes at higher effort) — this is a research tool, not a quick
-lookup.
+The Nimble tool executes deep-research runs on a Web Search Agent; the
+LlamaIndex agent decides when to call it and relays the citation-backed
+answer. Agent runs take tens of seconds — this is a research tool, not a
+quick lookup.
+
+Set NIMBLE_AGENT_ID to run on an agent you have provisioned; leave it unset
+and the API provisions one per run and returns its id.
 
 Requires:
     pip install llama-index-tools-nimble llama-index-llms-openai
     export NIMBLE_API_KEY=...      # Nimble API key
-    export NIMBLE_AGENT_ID=...     # a provisioned wsa_... agent instance
+    export NIMBLE_AGENT_ID=...     # optional: a provisioned wsa_... agent
     export OPENAI_API_KEY=...      # the agent's LLM
 
 Run:
@@ -26,7 +28,7 @@ from llama_index.tools.nimble import NimbleAgentToolSpec
 
 
 async def main() -> None:
-    tool_spec = NimbleAgentToolSpec(agent_id=os.environ["NIMBLE_AGENT_ID"])
+    tool_spec = NimbleAgentToolSpec(agent_id=os.environ.get("NIMBLE_AGENT_ID"))
     agent = FunctionAgent(
         tools=tool_spec.to_tool_list(),
         llm=OpenAI(model="gpt-4o-mini"),

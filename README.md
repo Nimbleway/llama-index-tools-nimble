@@ -78,56 +78,91 @@ source; `metadata["url"]` and `metadata["title"]` carry the same values for prog
 
 ## Deep research with the Agent API
 
-`NimbleAgentToolSpec` executes research tasks on a Nimble **Web Search Agent** you have
-already provisioned. Where `search` answers one query fast, an agent run researches the
-task on the live web — typically tens of seconds at low effort, up to minutes at higher
-effort — and returns one synthesized, citation-backed answer.
+`NimbleAgentToolSpec` executes research tasks on a Nimble **Web Search Agent**. Where
+`search` answers one query fast, an agent run researches the task on the live web —
+typically tens of seconds — and returns one synthesized, citation-backed answer.
 
 ```python
 from llama_index.tools.nimble import NimbleAgentToolSpec
 
-agent_tool = NimbleAgentToolSpec(agent_id="wsa_...")  # reads NIMBLE_API_KEY
+agent_tool = NimbleAgentToolSpec()  # reads NIMBLE_API_KEY
 doc = agent_tool.run(
     "What are the leading approaches to LLM guardrails, and who builds them?",
-    effort="low",
 )
 
 print(doc.text)                    # final answer + "Sources:" list
 print(doc.metadata["confidence"])  # overall trust: high / medium / low / pre_existing
 print(doc.metadata["claims"])      # per-claim citations (callouts or JSON paths)
+print(doc.metadata["web_search_agent_id"])  # the agent the API ran this on
 ```
 
-Provision an agent in the [Nimble dashboard](https://app.nimbleway.com) (or via
-`POST /v2/agents`) and pass its `wsa_...` id. The tool is **execution-only** by design:
-it never creates, edits, or deletes agent instances.
+`agent_id` is optional. Without it, the API provisions an agent per run and returns its
+id (`POST /v2/agents/runs`); with it, runs execute on that agent
+(`POST /v2/agents/{agent_id}/runs`). Either way the **returned** `web_search_agent_id` is
+what the tool uses for the status and result calls, and it is carried in the Document
+metadata so the run stays reachable afterwards.
+
+To pin runs to one agent, provision it in the [Nimble dashboard](https://app.nimbleway.com)
+(or via `POST /v2/agents`) and pass its `wsa_...` id. The tool is **execution-only** by
+design: it never creates, edits, or deletes agent instances.
+
+Structured controls are available per run:
+
+```python
+doc = agent_tool.run(
+    "Find the founding year and headquarters for this company.",
+    input_data={"company": "Acme", "domain": "acme.example"},
+    output_schema={
+        "type": "object",
+        "properties": {"founded": {"type": "integer"}, "hq": {"type": "string"}},
+    },
+    sources={"prioritize": "regulatory filings", "avoid": "press releases"},
+)
+```
 
 ### Constructor
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `agent_id` | `str` | — | Preconfigured Web Search Agent instance id (`wsa_...`). |
+| `agent_id` | `str \| None` | `None` | Optional preconfigured Web Search Agent instance id (`wsa_...`). Omit to have the API provision one per run. |
 | `api_key` | `str \| None` | `None` | Nimble API key; falls back to `NIMBLE_API_KEY`. |
+| `effort` | `low \| medium \| high \| x-high \| max \| None` | `None` | Optional application-level override. Omit to preserve the agent/template default; see the gated `max` behavior below. |
+| `agent_name` | `str \| None` | `None` | Optional SDK 1.2 name hint for the generated run agent. |
+| `skill` | `str \| None` | `None` | Optional SDK 1.2 skill identifier applied to the run. |
+| `use_case` | `research \| enrichment \| dataset_building \| None` | `None` | Optional SDK 1.2 run mode. |
+| `gate_policy` | `reject \| degrade` | `reject` | Treatment for gated values: stop with guidance, or explicitly and visibly use the closest generally available value. |
 | `timeout` | `float` | `300.0` | Overall deadline in seconds for one `run` call — creation, polling, and result retrieval together. Each HTTP request is bounded by the budget left when it is issued (with a 5 s connect ceiling), so a stalled request cannot fall back to the SDK's much longer default. |
-| `poll_interval` | `float` | `2.0` | Seconds between status polls, and the pause before re-attempting a transient failure. |
+| `poll_interval` | `float` | `10.0` | Seconds between status polls, and the pause before re-attempting a transient failure. It remains configurable; shorter values are intended only for tests. |
 
-### `run(task, effort="medium")`
+### `run(task, output_schema=None, input_data=None, sources=None)`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `task` | `str` | — | The research task or question, in natural language. |
-| `effort` | `"low" \| "medium" \| "high" \| "x-high" \| "max"` | `"medium"` | Higher effort is slower and more thorough. |
+| `output_schema` | `dict \| None` | `None` | JSON Schema the answer must match; returns structured JSON instead of prose. |
+| `input_data` | `dict \| list[dict] \| None` | `None` | Known data about one or more entities to research or enrich. |
+| `sources` | `dict \| None` | `None` | Source guidance, keyed `allow` / `block` (lists of source objects) and `prioritize` / `avoid` (free text). |
 
-As a rough guide from live runs: `low` answers in seconds, `medium` in ~1.5–3 minutes. The
-default `timeout` (300 s) covers both; at `high` effort and above, raise `timeout`
-accordingly. Note that `low` may skip live web research entirely and answer from the
-model alone (reported honestly as `confidence: "low"` with no sources) — use `medium`
-or higher when you need researched, cited answers.
+Effort is an optional application-level setting and is not exposed to the
+function-calling model. Omit it to use the selected agent/template default
+(the documented product default is `high`; template defaults may vary), or
+pass `effort="low"`, `"medium"`, `"high"`, or `"x-high"` to override it.
+`effort="max"` is also selectable as a coming-soon custom-budget capability.
+By default it stops before creating a run and links to the
+[Nimble product team](https://www.nimbleway.com/contact). Applications may
+explicitly select `gate_policy="degrade"` to continue on `x-high`; that
+requested-to-effective substitution is always announced with a warning.
 
-The returned `Document.text` is the final answer (prose, or pretty-printed JSON for
-structured agents) followed by a `Sources:` list, so agents can cite what was consulted.
-`Document.metadata` carries `run_id`, `agent_id`, `effort`, `output_type`, and the
-structured trust payload: `confidence`, `reasoning`, `sources`, and `claims` with
-per-claim citations.
+Run creation is issued **exactly once**. It is a non-idempotent, billable POST with no
+idempotency key, so a failure — transport, 409, 429, 5xx — is surfaced rather than
+retried: a retry after a proxy failed downstream of an accepted request would provision a
+second billable run.
+
+The returned `Document.text` is the final answer (prose, or pretty-printed JSON when an
+`output_schema` was given) followed by a `Sources:` list, so agents can cite what was
+consulted. `Document.metadata` carries `run_id`, `agent_id` / `web_search_agent_id`,
+`effort`, `output_type`, and the structured trust payload: `confidence`, `reasoning`,
+`sources`, and `claims` with per-claim citations.
 
 ### Errors
 

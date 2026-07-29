@@ -14,7 +14,10 @@ class NimbleAgentRunError(Exception):
 
     Attributes:
         run_id: The ``task_run_...`` identifier of the run.
-        agent_id: The ``wsa_...`` agent instance the run belongs to.
+        agent_id: The ``wsa_...`` agent instance the run belongs to — the id
+            the API returned for the run. ``None`` only when the run was
+            created without a configured agent and the response carried no
+            agent id, which is itself the failure being reported.
         status: The last run status observed, when one was observed.
     """
 
@@ -23,7 +26,7 @@ class NimbleAgentRunError(Exception):
         message: str,
         *,
         run_id: str,
-        agent_id: str,
+        agent_id: str | None,
         status: str | None = None,
     ) -> None:
         self.run_id = run_id

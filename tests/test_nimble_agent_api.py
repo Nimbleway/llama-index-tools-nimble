@@ -6,13 +6,18 @@ wire-shaped payloads, ``model_construct`` to smuggle in contract-violating
 states), so the mapping is exercised against the SDK's actual model layer.
 """
 
+import inspect
+import json
 from types import SimpleNamespace
+from typing import get_args
 from unittest.mock import ANY, MagicMock
 
 import httpx
 import pytest
 from llama_index.core.schema import Document
 from nimble_python import (
+    APIConnectionError,
+    APIStatusError,
     APITimeoutError,
     AuthenticationError,
     ConflictError,
@@ -39,8 +44,25 @@ from llama_index.tools.nimble import (
 )
 
 AGENT_ID = "wsa_00000000-0000-0000-0000-0000000000aa"
+# The id the API generates when a run is created without a configured agent.
+GENERATED_AGENT_ID = "wsa_11111111-1111-1111-1111-1111111111cc"
 RUN_ID = "task_run_00000000-0000-0000-0000-0000000000bb"
 CANARY_KEY = "canary-key-XYZ-do-not-leak"
+
+# Fields the released 1.2 run-create API accepts.
+ALLOWED_CREATE_KEYS = {
+    "agent_name",
+    "input",
+    "effort",
+    "enable_events",
+    "input_data",
+    "output_schema",
+    "previous_interaction_id",
+    "skill",
+    "sources",
+    "timeout",
+    "use_case",
+}
 
 
 # ---------------------------------------------------------------- builders
@@ -52,7 +74,7 @@ def _run_payload(status="queued", **overrides):
         "interaction_id": "int_1",
         "status": status,
         "is_active": status in ("queued", "running"),
-        "effort": "medium",
+        "effort": "low",
         "created_at": "2026-07-22T00:00:00Z",
         "web_search_agent_id": AGENT_ID,
     }
@@ -92,10 +114,10 @@ def _trust_payload(sources=None, claims=None, confidence="high", reasoning="ok")
     }
 
 
-def _text_result(content="The final answer.", **trust_kwargs):
+def _text_result(content="The final answer.", run_overrides=None, **trust_kwargs):
     return TaskRunResultPublicV2.model_validate(
         {
-            "run": _run_payload("completed"),
+            "run": _run_payload("completed", **(run_overrides or {})),
             "output": {
                 "type": "text",
                 "content": content,
@@ -144,8 +166,28 @@ def _api_error(cls, status_code):
     return cls("boom", response=response, body=None)
 
 
-def _spec(monkeypatch, api_key="test-key", timeout=300.0, poll_interval=2.0):
-    """Build a NimbleAgentToolSpec whose SDK client is a MagicMock."""
+def _spec(
+    monkeypatch,
+    api_key="test-key",
+    timeout=300.0,
+    poll_interval=10.0,
+    agent_id=AGENT_ID,
+    effort=None,
+    agent_name=None,
+    skill=None,
+    use_case=None,
+    gate_policy="reject",
+):
+    """Build a NimbleAgentToolSpec whose SDK client is a MagicMock.
+
+    ``agent_id=None`` exercises the generated-agent route, where the run is
+    created with ``client.agents.run(...)`` instead of
+    ``client.agents.runs.create(agent_id, ...)``.
+
+    Individual timing tests may pass a shorter interval as a test-only
+    override so their deterministic fake clocks can exercise deadline and
+    retry boundaries compactly.
+    """
     import nimble_python
 
     client = MagicMock()
@@ -160,8 +202,13 @@ def _spec(monkeypatch, api_key="test-key", timeout=300.0, poll_interval=2.0):
 
     monkeypatch.setattr(nimble_python, "Nimble", _fake_nimble)
     spec = NimbleAgentToolSpec(
-        agent_id=AGENT_ID,
+        agent_id=agent_id,
         api_key=api_key,
+        effort=effort,
+        agent_name=agent_name,
+        skill=skill,
+        use_case=use_case,
+        gate_policy=gate_policy,
         timeout=timeout,
         poll_interval=poll_interval,
     )
@@ -209,7 +256,7 @@ def test_full_lifecycle_queued_running_completed(monkeypatch, fake_clock):
     doc = spec.run("research task")
 
     client.agents.runs.create.assert_called_once_with(
-        AGENT_ID, input="research task", effort="medium", timeout=ANY
+        AGENT_ID, input="research task", timeout=ANY
     )
     client.agents.runs.get.assert_called_with(RUN_ID, agent_id=AGENT_ID, timeout=ANY)
     assert client.agents.runs.get.call_count == 2
@@ -231,16 +278,144 @@ def test_immediate_completion_skips_polling(monkeypatch, fake_clock):
     assert isinstance(doc, Document)
 
 
-def test_effort_passes_through_to_create(monkeypatch, fake_clock):
+# ------------------------------------------------- C01/C02: optional identity
+
+
+def test_absent_agent_id_uses_the_generic_run_route(monkeypatch, fake_clock):
+    """C01 — no configured agent: exactly one POST /v2/agents/runs."""
+    spec, client, _ = _spec(monkeypatch, agent_id=None)
+    client.agents.run.return_value = _created(
+        "completed", web_search_agent_id=GENERATED_AGENT_ID
+    )
+    client.agents.runs.result.return_value = _text_result(
+        run_overrides={"web_search_agent_id": GENERATED_AGENT_ID}
+    )
+
+    doc = spec.run("task")
+
+    client.agents.run.assert_called_once_with(input="task", timeout=ANY)
+    client.agents.runs.create.assert_not_called()
+    assert doc.metadata["agent_id"] == GENERATED_AGENT_ID
+
+
+def test_present_agent_id_uses_the_persistent_run_route(monkeypatch, fake_clock):
+    """C02 — configured agent: exactly one POST /v2/agents/{agent_id}/runs."""
     spec, client, _ = _spec(monkeypatch)
     client.agents.runs.create.return_value = _created("completed")
     client.agents.runs.result.return_value = _text_result()
 
-    spec.run("task", effort="x-high")
+    spec.run("task")
 
     client.agents.runs.create.assert_called_once_with(
-        AGENT_ID, input="task", effort="x-high", timeout=ANY
+        AGENT_ID, input="task", timeout=ANY
     )
+    client.agents.run.assert_not_called()
+
+
+def test_agent_id_is_optional_at_construction(monkeypatch):
+    import nimble_python
+
+    monkeypatch.setattr(nimble_python, "Nimble", lambda **kw: MagicMock())
+    assert NimbleAgentToolSpec().agent_id is None
+
+
+# ------------------------------------------------------ C04: optional effort
+
+
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+def test_every_create_body_omits_unspecified_effort(monkeypatch, fake_clock, agent_id):
+    """C04 — both routes preserve the server-side default when unspecified."""
+    spec, client, _ = _spec(monkeypatch, agent_id=agent_id)
+    created = _created("completed", web_search_agent_id=agent_id or GENERATED_AGENT_ID)
+    client.agents.runs.create.return_value = created
+    client.agents.run.return_value = created
+    client.agents.runs.result.return_value = _text_result(
+        run_overrides={"web_search_agent_id": agent_id or GENERATED_AGENT_ID}
+    )
+
+    spec.run("task")
+
+    create = client.agents.runs.create if agent_id else client.agents.run
+    assert "effort" not in create.call_args.kwargs
+
+
+@pytest.mark.parametrize("tier", ["low", "medium", "high", "x-high"])
+def test_constructor_effort_override_is_forwarded(monkeypatch, fake_clock, tier):
+    """C04 — documented, generally available effort overrides are preserved."""
+    spec, client, _ = _spec(monkeypatch, effort=tier)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    assert client.agents.runs.create.call_args.kwargs["effort"] == tier
+
+
+def test_effort_is_application_controlled_not_model_controlled(monkeypatch):
+    """C04 — applications choose effort; the function-calling model cannot.
+
+    ``max`` remains selectable at application level but is resolved before
+    dispatch under the gated-feature policy.
+    """
+    from llama_index.tools.nimble.agent import _EFFORT_LEVELS, EffortLevel
+
+    expected = ("low", "medium", "high", "x-high", "max")
+    assert _EFFORT_LEVELS == expected
+    assert get_args(EffortLevel) == expected
+
+    spec, client, _ = _spec(monkeypatch)
+    tool = next(t for t in spec.to_tool_list() if t.metadata.name == "run")
+    assert "effort" not in tool.metadata.fn_schema.model_fields
+    assert "effort" not in inspect.signature(spec.run).parameters
+
+    with pytest.raises(TypeError):
+        spec.run("task", effort="high")
+    client.agents.runs.create.assert_not_called()
+    client.agents.run.assert_not_called()
+
+
+def test_max_rejects_before_client_creation_with_positive_guidance(monkeypatch):
+    with pytest.raises(ValueError) as captured:
+        _spec(monkeypatch, effort="max")
+    message = str(captured.value)
+    assert "coming-soon" in message
+    assert "nothing was sent and no run was created" in message
+    assert "https://www.nimbleway.com/contact" in message
+
+
+def test_explicit_max_degradation_is_announced_and_sends_x_high(
+    monkeypatch, fake_clock
+):
+    with pytest.warns(UserWarning, match="effective effort='x-high'"):
+        spec, client, _ = _spec(monkeypatch, effort="max", gate_policy="degrade")
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task")
+
+    assert spec.requested_effort == "max"
+    assert client.agents.runs.create.call_args.kwargs["effort"] == "x-high"
+
+
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+def test_gated_effort_is_re_checked_at_dispatch(monkeypatch, fake_clock, agent_id):
+    """A gated tier assigned after construction still never reaches the wire.
+
+    The gate resolves in __init__, but `effort` is a plain public attribute:
+    without a check at the point that actually spends money, `spec.effort =
+    "max"` would send a gated tier silently — the one outcome the policy
+    exists to prevent.
+    """
+    spec, client, _ = _spec(monkeypatch, agent_id=agent_id)
+    spec.effort = "max"
+
+    with pytest.raises(ValueError) as captured:
+        spec.run("task")
+
+    assert "coming-soon" in str(captured.value)
+    assert "nothing was sent and no run was created" in str(captured.value)
+    client.agents.runs.create.assert_not_called()
+    client.agents.run.assert_not_called()
 
 
 def test_timeout_retains_run_id_and_skips_result(monkeypatch, fake_clock):
@@ -581,20 +756,6 @@ def test_implausible_retry_after_falls_back_to_backoff(monkeypatch, fake_clock):
     assert fake_clock.sleeps == [2.0, 2.0]  # back-off, not 600s
 
 
-def test_create_retries_a_transient_failure_then_succeeds(monkeypatch, fake_clock):
-    spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
-    client.agents.runs.create.side_effect = [
-        _api_error(InternalServerError, 500),
-        _created("completed"),
-    ]
-    client.agents.runs.result.return_value = _text_result()
-
-    doc = spec.run("task")
-
-    assert client.agents.runs.create.call_count == 2
-    assert doc.text.startswith("The final answer.")
-
-
 def test_malformed_retry_after_falls_back_to_poll_interval(monkeypatch, fake_clock):
     spec, client, _ = _spec(monkeypatch, timeout=60.0, poll_interval=2.0)
     client.agents.runs.create.return_value = _created("queued")
@@ -617,26 +778,57 @@ def test_malformed_retry_after_falls_back_to_poll_interval(monkeypatch, fake_clo
 def test_sdk_internal_retries_are_disabled(monkeypatch):
     # The SDK's own retry loop would issue several requests per call, each
     # with its own timeout, and could outlive the overall deadline; this tool
-    # owns retries instead.
+    # owns retries instead. It is also the load-bearing half of C03: without
+    # max_retries=0 the SDK would issue up to three POSTs *inside* a single
+    # create call, which no assertion on this adapter's call count could see.
     _, client, _ = _spec(monkeypatch)
     client.with_options.assert_called_once_with(max_retries=0)
 
 
-def test_create_attempts_are_capped(monkeypatch, fake_clock):
-    """Creating a run is a non-idempotent POST — never retried for the budget.
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+@pytest.mark.parametrize(
+    ("error_cls", "status_code"),
+    [
+        (APITimeoutError, None),  # transport failure
+        (APIConnectionError, None),  # transport failure
+        (APIStatusError, 408),
+        (ConflictError, 409),
+        (RateLimitError, 429),
+        (InternalServerError, 500),
+        (InternalServerError, 503),
+    ],
+)
+def test_create_is_never_retried(
+    monkeypatch, fake_clock, error_cls, status_code, agent_id
+):
+    """C03 — one POST per run(), whatever the failure, on either route.
 
-    A proxy that fails after the backend accepted the request would leave an
-    orphaned billable run behind, and a failed create surfaces no run id to
-    reconcile with, so attempts are capped well below the deadline.
+    Creating a run is a non-idempotent, billable POST with no idempotency
+    key. A failure response is not evidence the backend declined the work: a
+    proxy that fails *after* acceptance would leave an orphaned billable run
+    that this caller cannot even see, because a failed create surfaces no run
+    id. So the failure propagates on the first attempt, every time.
     """
-    spec, client, _ = _spec(monkeypatch, timeout=300.0, poll_interval=2.0)
-    client.agents.runs.create.side_effect = _api_error(InternalServerError, 500)
+    spec, client, _ = _spec(
+        monkeypatch, timeout=300.0, poll_interval=2.0, agent_id=agent_id
+    )
+    request = httpx.Request("POST", "https://api.test/v2")
+    if status_code is None:
+        failure = (
+            APITimeoutError(request=request)
+            if error_cls is APITimeoutError
+            else APIConnectionError(request=request)
+        )
+    else:
+        failure = _api_error(error_cls, status_code)
+    create = client.agents.runs.create if agent_id else client.agents.run
+    create.side_effect = failure
 
-    with pytest.raises(InternalServerError):
+    with pytest.raises(type(failure)):
         spec.run("task")
 
-    assert client.agents.runs.create.call_count == 3
-    assert fake_clock.now < 300.0  # gave up long before the budget
+    assert create.call_count == 1
+    assert fake_clock.sleeps == []  # not even a back-off before giving up
 
 
 def test_poll_attempts_are_capped(monkeypatch, fake_clock):
@@ -748,7 +940,8 @@ def test_text_result_document_mapping(monkeypatch, fake_clock):
     meta = doc.metadata
     assert meta["run_id"] == RUN_ID
     assert meta["agent_id"] == AGENT_ID
-    assert meta["effort"] == "medium"
+    assert meta["web_search_agent_id"] == AGENT_ID
+    assert meta["effort"] == "low"
     assert meta["output_type"] == "text"
     assert meta["confidence"] == "high"
     assert meta["reasoning"] == "ok"
@@ -885,10 +1078,10 @@ def test_param_descriptions_reach_the_tool_schema(monkeypatch):
     assert task_desc and "research" in task_desc.lower()
     assert task_desc.rstrip().endswith(".")
 
-    effort_desc = fields["effort"].description
-    assert effort_desc and effort_desc.rstrip().endswith(".")
-    for level in ("low", "medium", "high", "x-high", "max"):
-        assert f'"{level}"' in effort_desc
+    for name in ("output_schema", "input_data", "sources"):
+        desc = fields[name].description
+        assert desc and desc.rstrip().endswith(".")
+        assert fields[name].default is None  # optional for the model
 
 
 @pytest.mark.parametrize("bad_task", ["", "   "])
@@ -896,13 +1089,6 @@ def test_task_must_be_non_empty(monkeypatch, bad_task):
     spec, client, _ = _spec(monkeypatch)
     with pytest.raises(ValueError):
         spec.run(bad_task)
-    client.agents.runs.create.assert_not_called()
-
-
-def test_effort_must_be_a_known_level(monkeypatch):
-    spec, client, _ = _spec(monkeypatch)
-    with pytest.raises(ValueError):
-        spec.run("task", effort="turbo")  # type: ignore[arg-type]
     client.agents.runs.create.assert_not_called()
 
 
@@ -953,6 +1139,302 @@ def test_init_without_api_key_does_not_raise(monkeypatch):
     monkeypatch.setattr(nimble_python, "Nimble", lambda **kw: MagicMock())
     spec = NimbleAgentToolSpec(agent_id=AGENT_ID)  # SDK reads NIMBLE_API_KEY
     assert spec.client is not None
+
+
+# ------------------------------------------------------- C05/C06: identity
+
+
+def test_generated_identity_is_used_for_status_and_result(monkeypatch, fake_clock):
+    """C05 — the returned agent id, not the configured one, drives the run.
+
+    A generated agent's id exists only in the create response, so dropping it
+    strands the run: nothing else can address the poll or result call.
+    """
+    spec, client, _ = _spec(monkeypatch, agent_id=None)
+    client.agents.run.return_value = _created(
+        "queued", web_search_agent_id=GENERATED_AGENT_ID
+    )
+    client.agents.runs.get.return_value = _run(
+        "completed", web_search_agent_id=GENERATED_AGENT_ID
+    )
+    client.agents.runs.result.return_value = _text_result(
+        run_overrides={"web_search_agent_id": GENERATED_AGENT_ID}
+    )
+
+    doc = spec.run("task")
+
+    client.agents.runs.get.assert_called_with(
+        RUN_ID, agent_id=GENERATED_AGENT_ID, timeout=ANY
+    )
+    client.agents.runs.result.assert_called_once_with(
+        RUN_ID, agent_id=GENERATED_AGENT_ID, timeout=ANY
+    )
+    # …and it survives into the Document, so the run stays reachable later.
+    assert doc.metadata["run_id"] == RUN_ID
+    assert doc.metadata["web_search_agent_id"] == GENERATED_AGENT_ID
+
+
+def test_generated_identity_is_retained_in_errors(monkeypatch, fake_clock):
+    """C05 — a failed generated run is still traceable by its returned pair."""
+    spec, client, _ = _spec(monkeypatch, agent_id=None)
+    client.agents.run.return_value = _created(
+        "failed", web_search_agent_id=GENERATED_AGENT_ID
+    )
+
+    with pytest.raises(NimbleAgentRunFailedError) as excinfo:
+        spec.run("task")
+
+    assert excinfo.value.agent_id == GENERATED_AGENT_ID
+    assert excinfo.value.run_id == RUN_ID
+
+
+def test_create_without_agent_identity_is_a_protocol_error(monkeypatch, fake_clock):
+    """C05 — a create response with no agent id cannot be polled at all."""
+    spec, client, _ = _spec(monkeypatch, agent_id=None)
+    client.agents.run.return_value = RunCreateResponse.model_construct(
+        **{**_run_payload("queued"), "web_search_agent_id": None}
+    )
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert "web_search_agent_id" in str(excinfo.value)
+    client.agents.runs.get.assert_not_called()
+
+
+def test_create_on_a_different_agent_is_rejected(monkeypatch, fake_clock):
+    """C06 — never silently substitute the configured id for the returned one.
+
+    Papering over the mismatch would poll an agent the run does not belong
+    to: a 404 at best, another run's answer at worst.
+    """
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created(
+        "queued", web_search_agent_id=GENERATED_AGENT_ID
+    )
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert GENERATED_AGENT_ID in str(excinfo.value)
+    assert excinfo.value.agent_id == AGENT_ID
+    client.agents.runs.get.assert_not_called()
+
+
+def test_poll_response_for_another_owner_is_rejected(monkeypatch, fake_clock):
+    """C06 — a status response reporting a different pair is not this run."""
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.return_value = _run(
+        "completed", web_search_agent_id=GENERATED_AGENT_ID
+    )
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert "identity mismatch" in str(excinfo.value)
+    client.agents.runs.result.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["id", "web_search_agent_id"])
+def test_poll_response_without_identity_is_rejected(monkeypatch, fake_clock, missing):
+    """C05/C06 — an unverifiable poll envelope is not "no contradiction".
+
+    Absence is the case this guard exists for: a response that names neither
+    the run nor the agent cannot be shown to be this run's, so accepting it
+    would let the exact routing failure being guarded against pass silently.
+    """
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("queued")
+    client.agents.runs.get.return_value = RunGetResponse.model_construct(
+        **{**_run_payload("completed"), missing: None}
+    )
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert "identity mismatch" in str(excinfo.value)
+    assert excinfo.value.run_id == RUN_ID
+    client.agents.runs.result.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["id", "web_search_agent_id"])
+def test_result_without_identity_is_rejected(monkeypatch, fake_clock, missing):
+    """C05/C06 — same positive check on the result envelope."""
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    result = _text_result()
+    setattr(result.run, missing, None)
+    client.agents.runs.result.return_value = result
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert "identity mismatch" in str(excinfo.value)
+
+
+def test_check_owner_requires_both_ids_present(monkeypatch):
+    """C05/C06 — the guard itself, asserted directly on the absence case."""
+    spec, _, _ = _spec(monkeypatch)
+
+    with pytest.raises(NimbleAgentProtocolError):
+        spec._check_owner(SimpleNamespace(), RUN_ID, AGENT_ID)
+
+    # the fully-identified case still passes
+    spec._check_owner(
+        SimpleNamespace(id=RUN_ID, web_search_agent_id=AGENT_ID), RUN_ID, AGENT_ID
+    )
+
+
+@pytest.mark.parametrize(
+    "run_overrides",
+    [
+        {"id": "task_run_someone-else"},
+        {"web_search_agent_id": GENERATED_AGENT_ID},
+    ],
+)
+def test_result_for_another_owner_is_rejected(monkeypatch, fake_clock, run_overrides):
+    """C06 — a result envelope for a different pair must not be mapped.
+
+    Mapping it would attribute another run's answer, and its citations, to
+    this call — the one failure mode a trust-carrying Document must not have.
+    """
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result(run_overrides=run_overrides)
+
+    with pytest.raises(NimbleAgentProtocolError) as excinfo:
+        spec.run("task")
+
+    assert "identity mismatch" in str(excinfo.value)
+
+
+# ------------------------------------------- C07/C08/C09/C10: run controls
+
+
+_SCHEMA = {"type": "object", "properties": {"founded": {"type": "integer"}}}
+_ROWS = [{"company": "Acme", "domain": "acme.test"}]
+_SOURCES = {
+    "allow": [{"url": "https://example.org"}],
+    "block": [{"url": "https://spam.test"}],
+    "prioritize": "regulatory filings",
+    "avoid": "press releases",
+}
+
+
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # C07 research controls, C08 enrichment controls, C09 dataset controls
+        ({"output_schema": _SCHEMA, "sources": _SOURCES}, ["output_schema", "sources"]),
+        (
+            {"input_data": _ROWS, "output_schema": _SCHEMA, "sources": _SOURCES},
+            ["input_data", "output_schema", "sources"],
+        ),
+        ({"output_schema": _SCHEMA}, ["output_schema"]),
+        ({"input_data": _ROWS[0]}, ["input_data"]),  # single object, not a list
+    ],
+)
+def test_structured_controls_pass_through_unchanged(
+    monkeypatch, fake_clock, kwargs, expected, agent_id
+):
+    """Controls reach the create body byte-identical, on both routes.
+
+    Rewriting a caller's JSON Schema or source guidance would silently change
+    what the run is asked to produce, so they are validated and forwarded, not
+    normalized.
+    """
+    spec, client, _ = _spec(monkeypatch, agent_id=agent_id)
+    created = _created("completed", web_search_agent_id=agent_id or GENERATED_AGENT_ID)
+    client.agents.runs.create.return_value = created
+    client.agents.run.return_value = created
+    client.agents.runs.result.return_value = _text_result(
+        run_overrides={"web_search_agent_id": agent_id or GENERATED_AGENT_ID}
+    )
+
+    spec.run("task", **kwargs)
+
+    create = client.agents.runs.create if agent_id else client.agents.run
+    sent = create.call_args.kwargs
+    for key in expected:
+        assert sent[key] == kwargs[key]
+    # unset controls are omitted entirely, not sent as null
+    assert set(sent) - {"input", "effort", "timeout"} == set(expected)
+
+
+@pytest.mark.parametrize("agent_id", [AGENT_ID, None])
+def test_sdk_12_typed_run_fields_reach_both_create_routes(
+    monkeypatch, fake_clock, agent_id
+):
+    """Released SDK 1.2 fields are typed, forwarded, and never use extra_body."""
+    spec, client, _ = _spec(
+        monkeypatch,
+        agent_id=agent_id,
+        agent_name="market-research",
+        skill="competitive-intelligence",
+        use_case="research",
+    )
+    created = _created("completed", web_search_agent_id=agent_id or GENERATED_AGENT_ID)
+    client.agents.runs.create.return_value = created
+    client.agents.run.return_value = created
+    client.agents.runs.result.return_value = _text_result(
+        run_overrides={"web_search_agent_id": agent_id or GENERATED_AGENT_ID}
+    )
+
+    spec.run("task", output_schema=_SCHEMA, input_data=_ROWS, sources=_SOURCES)
+
+    create = client.agents.runs.create if agent_id else client.agents.run
+    sent = create.call_args.kwargs
+    assert sent["agent_name"] == "market-research"
+    assert sent["skill"] == "competitive-intelligence"
+    assert sent["use_case"] == "research"
+    assert "extra_body" not in sent
+    assert set(sent) <= ALLOWED_CREATE_KEYS
+
+
+def test_unsupported_source_keys_are_rejected(monkeypatch):
+    """C10 — the closed source-key set blocks smuggling an unpublished field."""
+    spec, client, _ = _spec(monkeypatch)
+
+    with pytest.raises(ValueError) as excinfo:
+        spec.run("task", sources={"allow": [], "skill": "deep_research"})
+
+    assert "skill" in str(excinfo.value)
+    client.agents.runs.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"output_schema": "not-a-dict"},
+        {"output_schema": [{"type": "object"}]},
+        {"input_data": "not-a-row"},
+        {"input_data": []},
+        {"input_data": ["not-a-row"]},
+        {"sources": ["https://example.org"]},
+    ],
+)
+def test_malformed_controls_are_rejected_before_any_billable_call(monkeypatch, kwargs):
+    spec, client, _ = _spec(monkeypatch)
+
+    with pytest.raises(ValueError):
+        spec.run("task", **kwargs)
+
+    client.agents.runs.create.assert_not_called()
+    client.agents.run.assert_not_called()
+
+
+def test_empty_sources_object_is_omitted(monkeypatch, fake_clock):
+    # An LLM filling an optional object often emits `{}`; sending it adds a
+    # meaningless key to a billable request rather than expressing anything.
+    spec, client, _ = _spec(monkeypatch)
+    client.agents.runs.create.return_value = _created("completed")
+    client.agents.runs.result.return_value = _text_result()
+
+    spec.run("task", sources={})
+
+    assert "sources" not in client.agents.runs.create.call_args.kwargs
 
 
 # ---------------------------------------------------------------- redaction
@@ -1075,6 +1557,67 @@ def test_real_client_binds_real_sdk_signatures(monkeypatch, fake_clock):
         ("GET", f"/v2/agents/{AGENT_ID}/runs/{RUN_ID}/result"),
     ]
     assert all(header == "llama-index-tools-nimble" for _, _, header in seen)
+
+
+def test_generic_route_binds_real_sdk_signatures(monkeypatch, fake_clock):
+    """C01/C04/C05/C10 asserted on the wire, not on a mock's call log.
+
+    A MagicMock accepts any call shape, so only the real client proves that
+    ``agents.run`` exists with these kwargs, that the generic path is
+    ``POST /v2/agents/runs``, and that the generated agent id is what the
+    follow-up URLs are built from.
+    """
+    import nimble_python
+    from nimble_python import Nimble as RealNimble
+
+    seen: list[tuple[str, str]] = []
+    posted: dict = {}
+    generated = _run_payload("queued", web_search_agent_id=GENERATED_AGENT_ID)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "POST":
+            posted.update(json.loads(request.content))
+            return httpx.Response(202, json=generated)
+        if request.url.path.endswith("/result"):
+            return httpx.Response(
+                200,
+                json={
+                    "run": _run_payload(
+                        "completed", web_search_agent_id=GENERATED_AGENT_ID
+                    ),
+                    "output": {
+                        "type": "json",
+                        "content": {"founded": 1999},
+                        "trust": _trust_payload(claims=[]),
+                    },
+                },
+            )
+        return httpx.Response(
+            200, json=_run_payload("completed", web_search_agent_id=GENERATED_AGENT_ID)
+        )
+
+    monkeypatch.setattr(
+        nimble_python,
+        "Nimble",
+        lambda **kw: RealNimble(
+            **kw, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+        ),
+    )
+    spec = NimbleAgentToolSpec(api_key="test-key")
+
+    doc = spec.run("wire task", output_schema=_SCHEMA, sources=_SOURCES)
+
+    assert seen == [
+        ("POST", "/v2/agents/runs"),
+        ("GET", f"/v2/agents/{GENERATED_AGENT_ID}/runs/{RUN_ID}"),
+        ("GET", f"/v2/agents/{GENERATED_AGENT_ID}/runs/{RUN_ID}/result"),
+    ]
+    assert "effort" not in posted
+    assert posted["output_schema"] == _SCHEMA
+    assert posted["sources"] == _SOURCES
+    assert set(posted) <= ALLOWED_CREATE_KEYS - {"timeout"}
+    assert doc.metadata["web_search_agent_id"] == GENERATED_AGENT_ID
 
 
 def test_remaining_budget_reaches_the_wire(monkeypatch, fake_clock):

@@ -12,7 +12,7 @@ authors = [{ name = "Nimbleway" }]
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",
-    "nimble-python>=1.0.0,<2.0.0",
+    "nimble-python>=1.2.0,<2.0.0",
 ]
 
 [project.urls]

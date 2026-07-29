@@ -2,6 +2,7 @@
 
 import json
 import time
+import warnings
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from random import random
@@ -16,6 +17,7 @@ from llama_index.core.tools.tool_spec.base import BaseToolSpec
 # `Timeout` is the SDK's re-export of httpx's, so per-phase request timeouts
 # need no dependency this package does not already have.
 from nimble_python import APIConnectionError, APIError, APIStatusError, Timeout
+from nimble_python.types.agent_run_response import AgentRunResponse
 from nimble_python.types.agents.run_create_response import RunCreateResponse
 from nimble_python.types.agents.run_get_response import RunGetResponse
 from nimble_python.types.agents.run_result_response import TaskRunResultPublicV2
@@ -27,15 +29,35 @@ from llama_index.tools.nimble.errors import (
     NimbleAgentTimeoutError,
 )
 
+# ``max`` remains selectable even though it is a coming-soon custom-budget
+# capability. It is resolved before dispatch: reject by default, or explicitly
+# and visibly degrade to the closest generally available tier (``x-high``).
 EffortLevel = Literal["low", "medium", "high", "x-high", "max"]
+GatePolicy = Literal["reject", "degrade"]
+UseCase = Literal["research", "enrichment", "dataset_building"]
 
 # Runtime view of EffortLevel, derived so the two can never drift.
 _EFFORT_LEVELS: tuple[str, ...] = get_args(EffortLevel)
+_GATE_POLICIES: tuple[str, ...] = get_args(GatePolicy)
+_USE_CASES: tuple[str, ...] = get_args(UseCase)
+_MAX_CONTACT = "https://www.nimbleway.com/contact"
+
+# Tiers that are selectable but not generally available, and the tier a
+# `degrade` policy substitutes. Kept as data so the gate is enforced from one
+# place — construction resolves it, dispatch re-checks it.
+_GATED_EFFORT_LEVELS: frozenset[str] = frozenset({"max"})
+_GATED_EFFORT_FALLBACK: EffortLevel = "x-high"
+
 _NONTERMINAL_STATUSES: tuple[str, ...] = ("queued", "running")
 _TERMINAL_STATUSES: tuple[str, ...] = ("completed", "failed", "cancelled")
 
-# A run's state object: the creation response or a subsequent poll response.
-_RunState = RunCreateResponse | RunGetResponse
+# Source-guidance keys the published nested `sources` object accepts. Typed
+# top-level controls such as `skill`, `use_case`, and `agent_name` have their
+# own constructor parameters and cannot be smuggled through this dict.
+_SOURCE_KEYS: frozenset[str] = frozenset({"allow", "block", "prioritize", "avoid"})
+
+# A run's state object: a create response (either route) or a poll response.
+_RunState = AgentRunResponse | RunCreateResponse | RunGetResponse
 
 # Same attribution value the search tool sends; keep the two in sync.
 _CLIENT_SOURCE = "llama-index-tools-nimble"
@@ -52,12 +74,34 @@ _CONNECT_TIMEOUT = 5.0
 _MAX_RETRY_DELAY = 8.0
 _MAX_RETRY_AFTER = 60.0
 
-# Attempt ceilings, so the deadline is never the only thing bounding request
-# volume. Creating a run is capped hardest: it is a non-idempotent POST.
-_MAX_CREATE_ATTEMPTS = 3
+# Attempt ceiling for the *read-only* calls (polling, result), so the deadline
+# is never the only thing bounding request volume. Run creation is deliberately
+# absent here: it is a non-idempotent, billable POST and is never re-attempted.
 _MAX_ATTEMPTS = 5
 
 _RETRYABLE_STATUSES: tuple[int, ...] = (408, 429)
+
+
+def _gated_effort_message(requested: str | None, *, effective: str | None) -> str:
+    """The notice shown whenever a gated tier is requested.
+
+    Positive and actionable in both directions: it names what was asked for,
+    says exactly what happened instead, and points at the people who can turn
+    the capability on. The gate is never silent — a rejection explains that
+    no run was created, and a degrade announces the substitution rather than
+    quietly billing a different tier than the one requested.
+    """
+    outcome = (
+        f"effective effort={effective!r} because gate_policy='degrade' "
+        "was selected explicitly"
+        if effective is not None
+        else "nothing was sent and no run was created"
+    )
+    return (
+        f"Max effort is a coming-soon custom-budget capability. "
+        f"Requested effort={requested!r}; {outcome}. "
+        f"Talk to the Nimble product team about enabling Max: {_MAX_CONTACT}"
+    )
 
 
 def _retry_after_seconds(exc: APIError) -> float | None:
@@ -111,34 +155,69 @@ def _is_retryable(exc: APIError, *, allow_conflict: bool = False) -> bool:
 class NimbleAgentToolSpec(BaseToolSpec):
     """Nimble Agent API tool spec.
 
-    Executes research tasks on a **preconfigured** Nimble Web Search Agent
-    (``POST /v2/agents/{agent_id}/runs``) and exposes that to a LlamaIndex
-    agent as a ``run`` tool. Runs are asynchronous server-side: this tool
-    creates the run, polls until it reaches a terminal status, then fetches
-    and maps the result.
+    Executes research tasks on a Nimble Web Search Agent and exposes that to a
+    LlamaIndex agent as a ``run`` tool. Runs are asynchronous server-side: this
+    tool creates the run, polls until it reaches a terminal status, then
+    fetches and maps the result.
+
+    Agent identity is optional:
+
+    * with ``agent_id``, the run executes on that preconfigured agent
+      (``POST /v2/agents/{agent_id}/runs``);
+    * without it, the API provisions an agent for the run
+      (``POST /v2/agents/runs``) and returns its id.
+
+    Either way the *returned* ``web_search_agent_id`` — not the configured
+    one — is the authority for the polling and result calls that follow, and
+    a mismatch between the two is rejected rather than papered over.
 
     The tool is execution-only by design: creating, configuring, or deleting
     agent instances is account administration and stays outside the LLM
-    surface. Provision an agent in the Nimble dashboard (or via the API) and
-    pass its ``wsa_...`` id here.
+    surface. To pin runs to a provisioned agent, create it in the Nimble
+    dashboard (or via the API) and pass its ``wsa_...`` id here.
+
+    Effort is an optional constructor-level policy, not an LLM-facing tool
+    argument. When omitted, run creation omits the field so Nimble applies the
+    selected agent/template default (the documented product default is
+    ``high``, while template defaults may vary).
     """
 
     spec_functions = ["run"]
 
     def __init__(
         self,
-        agent_id: str,
+        agent_id: str | None = None,
         api_key: str | None = None,
+        effort: EffortLevel | None = None,
+        agent_name: str | None = None,
+        skill: str | None = None,
+        use_case: UseCase | None = None,
+        gate_policy: GatePolicy = "reject",
         timeout: float = 300.0,
-        poll_interval: float = 2.0,
+        poll_interval: float = 10.0,
     ) -> None:
         """Initialize the tool spec.
 
         Args:
-            agent_id: Id of the preconfigured Web Search Agent instance
-                (format ``wsa_<uuid>``) that runs will execute on.
+            agent_id: Optional id of a preconfigured Web Search Agent instance
+                (format ``wsa_<uuid>``) to run on. When omitted, each run is
+                created through the generic route and the API provisions the
+                agent, returning its id on the run.
             api_key: Nimble API key. If omitted, the SDK reads
                 ``NIMBLE_API_KEY`` from the environment.
+            effort: Optional per-run override: ``low``, ``medium``, ``high``,
+                ``x-high``, or the coming-soon custom-budget ``max`` tier.
+                ``max`` stops with product-team guidance unless
+                ``gate_policy="degrade"`` is selected explicitly, in which
+                case the effective tier is ``x-high`` and a warning announces
+                the substitution. When omitted, Nimble applies the
+                agent/template default.
+            agent_name: Optional typed SDK hint for the run's generated agent.
+            skill: Optional typed SDK skill identifier.
+            use_case: Optional typed SDK mode: ``research``, ``enrichment``,
+                or ``dataset_building``.
+            gate_policy: Treatment for gated values. ``reject`` stops before
+                dispatch; ``degrade`` explicitly maps ``max`` to ``x-high``.
             timeout: Overall deadline in seconds for one ``run`` call,
                 covering creation, polling, and result retrieval. Every HTTP
                 request is bounded by the budget left at the moment it is
@@ -152,10 +231,36 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 run is not cancelled and can be fetched later via its
                 ``run_id``.
             poll_interval: Seconds between status polls, and the pause before
-                re-attempting a transient failure.
+                re-attempting a transient failure. Defaults to 10 seconds;
+                shorter values are intended only for tests.
         """
-        if not agent_id or not agent_id.strip():
-            raise ValueError("agent_id must be a non-empty string")
+        if agent_id is not None and not agent_id.strip():
+            raise ValueError("agent_id must be a non-empty string or None")
+        if effort is not None and effort not in _EFFORT_LEVELS:
+            raise ValueError(
+                f"effort must be one of {_EFFORT_LEVELS} or None, got {effort!r}"
+            )
+        if gate_policy not in _GATE_POLICIES:
+            raise ValueError(
+                f"gate_policy must be one of {_GATE_POLICIES}, got {gate_policy!r}"
+            )
+        for name, value in (("agent_name", agent_name), ("skill", skill)):
+            if value is not None and not value.strip():
+                raise ValueError(f"{name} must be a non-empty string or None")
+        if use_case is not None and use_case not in _USE_CASES:
+            raise ValueError(
+                f"use_case must be one of {_USE_CASES} or None, got {use_case!r}"
+            )
+        requested_effort = effort
+        if effort in _GATED_EFFORT_LEVELS:
+            if gate_policy == "reject":
+                raise ValueError(_gated_effort_message(effort, effective=None))
+            effort = _GATED_EFFORT_FALLBACK
+            warnings.warn(
+                _gated_effort_message(requested_effort, effective=effort),
+                UserWarning,
+                stacklevel=2,
+            )
         if timeout <= 0:
             raise ValueError(f"timeout must be > 0 seconds, got {timeout}")
         if poll_interval <= 0:
@@ -170,30 +275,48 @@ class NimbleAgentToolSpec(BaseToolSpec):
         # Retries are disabled on the client because this tool owns them: the
         # SDK's own retry loop would issue up to three requests, each with its
         # own timeout, and could outlive the overall deadline several times
-        # over. The poll and result loops re-attempt transient failures
-        # themselves, always inside the remaining budget.
+        # over. Worse, it would apply to run creation — a non-idempotent,
+        # billable POST with no idempotency key. The read-only poll and result
+        # loops re-attempt transient failures themselves, always inside the
+        # remaining budget; creation never does.
         self.client = Nimble(
             api_key=api_key,
             default_headers={"X-Client-Source": _CLIENT_SOURCE},
         ).with_options(max_retries=0)
         self.agent_id = agent_id
+        self.effort = effort
+        self.requested_effort = requested_effort
+        self.agent_name = agent_name
+        self.skill = skill
+        self.use_case = use_case
+        self.gate_policy = gate_policy
         self.timeout = float(timeout)
         self.poll_interval = float(poll_interval)
 
-    def run(self, task: str, effort: EffortLevel = "medium") -> Document:
-        """Run a research task on the configured Nimble Web Search Agent.
+    def run(
+        self,
+        task: str,
+        output_schema: dict[str, Any] | None = None,
+        input_data: list[dict[str, Any]] | dict[str, Any] | None = None,
+        sources: dict[str, Any] | None = None,
+    ) -> Document:
+        """Run a research task on a Nimble Web Search Agent.
 
         The agent researches the task on the live web and returns a final,
         citation-backed answer. This is a long-running call: expect tens of
-        seconds at low effort, up to minutes at higher effort. Use it for
-        questions that need researched, synthesized answers; use a plain
-        search tool for quick lookups.
+        seconds. Use it for questions that need researched, synthesized
+        answers; use a plain search tool for quick lookups.
 
         Args:
             task (str): The research task or question, in natural language.
                 Be specific about what the answer should contain.
-            effort (str): One of "low", "medium", "high", "x-high", or "max".
-                Higher effort is slower and more thorough.
+            output_schema (dict): Optional JSON Schema the answer must match.
+                Supply it to get structured JSON back instead of prose.
+            input_data (dict): Optional object (or list of objects) to enrich.
+                Each row holds known data about one entity to research.
+            sources (dict): Optional guidance keyed allow/block/prioritize/avoid.
+                "allow" and "block" take lists of source objects;
+                "prioritize" and "avoid" take free-text guidance.
 
         Returns:
             A Document. Its text is the agent's final answer (prose, or JSON
@@ -216,30 +339,34 @@ class NimbleAgentToolSpec(BaseToolSpec):
 
         A failure to even start the run raises the underlying SDK exception
         unchanged (for example ``AuthenticationError`` on a bad key): no run
-        exists yet, so there is no ``run_id`` to attach.
+        exists yet, so there is no ``run_id`` to attach. Creation is never
+        re-attempted — see :meth:`_create_run`.
         """
         if not task or not task.strip():
             raise ValueError("task must be a non-empty string")
-        if effort not in _EFFORT_LEVELS:
-            raise ValueError(f"effort must be one of {_EFFORT_LEVELS}, got {effort!r}")
+        controls = self._validate_controls(output_schema, input_data, sources)
 
         # One budget covers the whole call: creation, polling, and result
         # retrieval all draw from this deadline.
         deadline = time.monotonic() + self.timeout
 
-        created = self._create_run(task, effort, deadline)
-        run_state = self._poll_until_terminal(created, deadline)
+        created = self._create_run(task, controls, deadline)
+        # The run's own agent id — generated or preconfigured — owns every
+        # later request; `self.agent_id` is only ever a cross-check.
+        agent_id = self._resolve_agent_id(created)
+
+        run_state = self._poll_until_terminal(created, agent_id, deadline)
         status = run_state.status
 
         if status == "completed":
-            result = self._fetch_result(run_state.id, deadline)
-            return self._to_document(result)
+            result = self._fetch_result(run_state.id, agent_id, deadline)
+            return self._to_document(result, agent_id)
         if status == "failed":
             detail = self._run_error_message(run_state) or "no error detail provided"
             raise NimbleAgentRunFailedError(
                 f"agent run failed: {detail}",
                 run_id=run_state.id,
-                agent_id=self.agent_id,
+                agent_id=agent_id,
                 status=status,
             )
         if status == "cancelled":
@@ -252,7 +379,7 @@ class NimbleAgentToolSpec(BaseToolSpec):
             raise NimbleAgentRunCancelledError(
                 message,
                 run_id=run_state.id,
-                agent_id=self.agent_id,
+                agent_id=agent_id,
                 status=status,
             )
         # _poll_until_terminal only returns documented terminal statuses;
@@ -260,9 +387,103 @@ class NimbleAgentToolSpec(BaseToolSpec):
         raise NimbleAgentProtocolError(
             f"unexpected terminal run status {status!r}",
             run_id=run_state.id,
-            agent_id=self.agent_id,
+            agent_id=agent_id,
             status=status,
         )
+
+    @staticmethod
+    def _validate_controls(
+        output_schema: dict[str, Any] | None,
+        input_data: list[dict[str, Any]] | dict[str, Any] | None,
+        sources: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Check the optional structured controls and collect what was set.
+
+        These arrive from an LLM as often as from application code, so they
+        are validated shape-first and passed through unchanged: this adapter
+        never rewrites a caller's schema or source guidance.
+
+        ``sources`` is restricted to the keys the nested object actually
+        accepts. ``skill``, ``use_case``, and ``agent_name`` are typed
+        top-level SDK parameters set by the application at construction, not
+        run arguments, so a model filling this tool schema cannot reach them
+        through a nested dict.
+        """
+        controls: dict[str, Any] = {}
+        if output_schema is not None:
+            if not isinstance(output_schema, dict):
+                raise ValueError("output_schema must be a JSON Schema object (dict)")
+            controls["output_schema"] = output_schema
+        if input_data is not None:
+            rows = input_data if isinstance(input_data, list) else [input_data]
+            if not rows or not all(isinstance(row, dict) for row in rows):
+                raise ValueError(
+                    "input_data must be a non-empty object or list of objects"
+                )
+            controls["input_data"] = input_data
+        if sources is not None:
+            if not isinstance(sources, dict):
+                raise ValueError("sources must be an object (dict)")
+            unknown = sorted(set(sources) - _SOURCE_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"sources keys must be within {sorted(_SOURCE_KEYS)}, "
+                    f"got unsupported {unknown}"
+                )
+            if sources:
+                controls["sources"] = sources
+        return controls
+
+    def _resolve_agent_id(self, created: _RunState) -> str:
+        """The agent id the API bound the run to, validated against config.
+
+        The create response is the only place a generated agent's id ever
+        appears, so losing it means losing the ability to poll the run at all.
+        When an agent was configured, a differing returned id means the run is
+        not the one that was asked for; substituting the configured id would
+        hide that and then 404 (or, worse, read someone else's run).
+        """
+        returned = getattr(created, "web_search_agent_id", None)
+        if not returned:
+            raise NimbleAgentProtocolError(
+                "run creation returned no web_search_agent_id",
+                run_id=getattr(created, "id", "unknown"),
+                agent_id=self.agent_id,
+                status=str(getattr(created, "status", None)),
+            )
+        if self.agent_id is not None and returned != self.agent_id:
+            raise NimbleAgentProtocolError(
+                f"run was created on a different agent than requested "
+                f"(returned {returned})",
+                run_id=created.id,
+                agent_id=self.agent_id,
+                status=str(created.status),
+            )
+        return str(returned)
+
+    @staticmethod
+    def _check_owner(state: Any, run_id: str, agent_id: str) -> None:
+        """Require a lifecycle response to identify itself as this run.
+
+        Polling and result requests are addressed by the ``(agent, run)``
+        pair, and the contract requires both ids back on every envelope. So
+        the check is positive — both present *and* equal — not merely
+        "no contradiction": a response carrying no identity at all is
+        unverifiable, and accepting it would let exactly the case this guard
+        exists for pass through unnoticed. Either way, mapping a response
+        that is not provably this run's would attribute another run's
+        answer — or another tenant's — to this call.
+        """
+        returned_run = getattr(state, "id", None)
+        returned_agent = getattr(state, "web_search_agent_id", None)
+        if returned_run != run_id or returned_agent != agent_id:
+            raise NimbleAgentProtocolError(
+                f"response identity mismatch (got agent {returned_agent!r}, "
+                f"run {returned_run!r})",
+                run_id=run_id,
+                agent_id=agent_id,
+                status=str(getattr(state, "status", None)),
+            )
 
     def _request_timeout(self, deadline: float) -> Timeout:
         """Budget left for one request, as a per-phase HTTP timeout.
@@ -289,34 +510,57 @@ class NimbleAgentToolSpec(BaseToolSpec):
         return min(backoff * (1 - 0.25 * random()), remaining)
 
     def _create_run(
-        self, task: str, effort: EffortLevel, deadline: float
-    ) -> RunCreateResponse:
-        """Start the run, bounded by the overall deadline.
+        self, task: str, controls: dict[str, Any], deadline: float
+    ) -> _RunState:
+        """Start the run — exactly one POST — bounded by the overall deadline.
 
         Creating a run is a non-idempotent POST that provisions billable
-        server-side work, and a failure gives no run id to reconcile with, so
-        attempts are capped rather than left to fill the budget: a proxy that
-        fails *after* the backend accepted the request would otherwise leave a
-        trail of orphaned runs. SDK errors propagate unwrapped — no run exists
-        yet, so the SDK exception is the most informative thing to surface.
-        """
-        for attempt in range(1, _MAX_CREATE_ATTEMPTS + 1):
-            try:
-                return self.client.agents.runs.create(
-                    self.agent_id,
-                    input=task,
-                    effort=effort,
-                    timeout=self._request_timeout(deadline),
-                )
-            except APIError as exc:
-                remaining = deadline - time.monotonic()
-                last = attempt == _MAX_CREATE_ATTEMPTS
-                if last or not _is_retryable(exc) or remaining <= 0:
-                    raise
-                time.sleep(self._retry_delay(exc, attempt, remaining))
-        raise AssertionError("unreachable")  # pragma: no cover
+        server-side work, and the API exposes no idempotency key. A failure
+        response is not evidence the backend declined the work: a proxy that
+        times out, 409s, or 502s *after* the backend accepted the request
+        would leave an orphaned billable run behind, invisible to this caller
+        because a failed create surfaces no run id to reconcile with. So this
+        is issued once, and once only — the SDK's own retry loop is disabled
+        in ``__init__`` for the same reason. SDK errors propagate unwrapped:
+        no run exists to attach context to, so the SDK exception is the most
+        informative thing to surface.
 
-    def _poll_until_terminal(self, created: _RunState, deadline: float) -> _RunState:
+        Route follows identity: a configured agent uses its own runs
+        collection, no agent uses the generic route that provisions one.
+        """
+        timeout = self._request_timeout(deadline)
+        create_options: dict[str, Any] = {
+            "input": task,
+            "timeout": timeout,
+            **controls,
+        }
+        if self.effort is not None:
+            # Backstop, not a duplicate: the gate resolves at construction,
+            # but `effort` is a plain public attribute, so a gated tier can
+            # still be assigned afterwards. Re-checking at the one point that
+            # actually spends money is what makes "never silently sent" true
+            # of the request rather than only of the constructor.
+            if self.effort in _GATED_EFFORT_LEVELS:
+                raise ValueError(_gated_effort_message(self.effort, effective=None))
+            create_options["effort"] = self.effort
+        if self.agent_name is not None:
+            create_options["agent_name"] = self.agent_name
+        if self.skill is not None:
+            create_options["skill"] = self.skill
+        if self.use_case is not None:
+            create_options["use_case"] = self.use_case
+        if self.agent_id is not None:
+            return self.client.agents.runs.create(
+                self.agent_id,
+                **create_options,
+            )
+        return self.client.agents.run(
+            **create_options,
+        )
+
+    def _poll_until_terminal(
+        self, created: _RunState, agent_id: str, deadline: float
+    ) -> _RunState:
         """Poll the run until a documented terminal status or the deadline.
 
         Uses a monotonic-clock deadline (not an attempt count), and passes the
@@ -332,24 +576,24 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 raise NimbleAgentProtocolError(
                     f"unknown run status {status!r}",
                     run_id=run_state.id,
-                    agent_id=self.agent_id,
+                    agent_id=agent_id,
                     status=str(status),
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise self._timeout_error(run_state.id, status)
+                raise self._timeout_error(run_state.id, agent_id, status)
             time.sleep(min(self.poll_interval, remaining))
-            run_state = self._get_run(run_state.id, deadline, status)
+            run_state = self._get_run(run_state.id, agent_id, deadline, status)
 
     def _get_run(
-        self, run_id: str, deadline: float, last_status: str
+        self, run_id: str, agent_id: str, deadline: float, last_status: str
     ) -> RunGetResponse:
         """Fetch current run state, re-attempting transients within budget."""
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                return self.client.agents.runs.get(
+                state = self.client.agents.runs.get(
                     run_id,
-                    agent_id=self.agent_id,
+                    agent_id=agent_id,
                     timeout=self._request_timeout(deadline),
                 )
             except APIError as exc:
@@ -358,15 +602,20 @@ class NimbleAgentToolSpec(BaseToolSpec):
                     raise NimbleAgentProtocolError(
                         f"polling failed ({type(exc).__name__}: {exc})",
                         run_id=run_id,
-                        agent_id=self.agent_id,
+                        agent_id=agent_id,
                         status=last_status,
                     ) from exc
                 if remaining <= 0:
-                    raise self._timeout_error(run_id, last_status) from exc
+                    raise self._timeout_error(run_id, agent_id, last_status) from exc
                 time.sleep(self._retry_delay(exc, attempt, remaining))
+            else:
+                self._check_owner(state, run_id, agent_id)
+                return state
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _fetch_result(self, run_id: str, deadline: float) -> TaskRunResultPublicV2:
+    def _fetch_result(
+        self, run_id: str, agent_id: str, deadline: float
+    ) -> TaskRunResultPublicV2:
         """Fetch the result of a completed run and validate its shape.
 
         Only called after observing ``completed``: fetching earlier is a 409
@@ -380,7 +629,7 @@ class NimbleAgentToolSpec(BaseToolSpec):
             try:
                 result = self.client.agents.runs.result(
                     run_id,
-                    agent_id=self.agent_id,
+                    agent_id=agent_id,
                     timeout=self._request_timeout(deadline),
                 )
                 break
@@ -391,11 +640,11 @@ class NimbleAgentToolSpec(BaseToolSpec):
                     raise NimbleAgentProtocolError(
                         f"result fetch failed ({type(exc).__name__}: {exc})",
                         run_id=run_id,
-                        agent_id=self.agent_id,
+                        agent_id=agent_id,
                         status="completed",
                     ) from exc
                 if remaining <= 0:
-                    raise self._timeout_error(run_id, "completed") from exc
+                    raise self._timeout_error(run_id, agent_id, "completed") from exc
                 time.sleep(self._retry_delay(exc, attempt, remaining))
         assert result is not None  # loop either returns a result or raises
 
@@ -416,12 +665,13 @@ class NimbleAgentToolSpec(BaseToolSpec):
             raise NimbleAgentProtocolError(
                 "completed run returned no output payload",
                 run_id=run_id,
-                agent_id=self.agent_id,
+                agent_id=agent_id,
                 status="completed",
             )
+        self._check_owner(getattr(result, "run", None), run_id, agent_id)
         return result
 
-    def _to_document(self, result: TaskRunResultPublicV2) -> Document:
+    def _to_document(self, result: TaskRunResultPublicV2, agent_id: str) -> Document:
         """Render a successful run result as a Document.
 
         The answer and its source URLs are embedded in the text (not only
@@ -471,9 +721,13 @@ class NimbleAgentToolSpec(BaseToolSpec):
         if not text:
             text = f"Run {run.id} completed with no answer content."
 
+        # Identity here is the pair the API returned, not the configured one:
+        # a generated agent's id exists nowhere else, so this is what carries
+        # it out of the call.
         metadata: dict[str, Any] = {
             "run_id": run.id,
-            "agent_id": self.agent_id,
+            "agent_id": agent_id,
+            "web_search_agent_id": agent_id,
             "effort": run.effort,
             "output_type": output_type,
             "confidence": trust.confidence,
@@ -483,7 +737,9 @@ class NimbleAgentToolSpec(BaseToolSpec):
         }
         return Document(text=text, extra_info=metadata)
 
-    def _timeout_error(self, run_id: str, status: str) -> NimbleAgentTimeoutError:
+    def _timeout_error(
+        self, run_id: str, agent_id: str, status: str
+    ) -> NimbleAgentTimeoutError:
         """The timeout message, phrased for where the budget ran out."""
         if status == "completed":
             # The run finished; only fetching its output ran out of time, so
@@ -500,7 +756,7 @@ class NimbleAgentToolSpec(BaseToolSpec):
         return NimbleAgentTimeoutError(
             message,
             run_id=run_id,
-            agent_id=self.agent_id,
+            agent_id=agent_id,
             status=status,
         )
 
