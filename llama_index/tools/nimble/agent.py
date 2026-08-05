@@ -80,6 +80,13 @@ _MAX_RETRY_AFTER = 60.0
 # absent here: it is a non-idempotent, billable POST and is never re-attempted.
 _MAX_ATTEMPTS = 5
 
+# Omitted effort preserves the agent/template default, whose documented product
+# default is ``high`` and commonly takes 5–15 minutes. Keep the client-side
+# lifecycle deadline above that range so a default-configured tool does not
+# abandon a healthy default-effort run. Callers can still choose a shorter
+# deadline explicitly for low-effort or latency-bounded workflows.
+_DEFAULT_TIMEOUT = 1800.0
+
 _RETRYABLE_STATUSES: tuple[int, ...] = (408, 429)
 
 
@@ -237,7 +244,7 @@ class NimbleAgentToolSpec(BaseToolSpec):
         skill: str | None = None,
         use_case: UseCase | None = None,
         gate_policy: GatePolicy = "reject",
-        timeout: float = 300.0,
+        timeout: float = _DEFAULT_TIMEOUT,
         poll_interval: float = 10.0,
     ) -> None:
         """Initialize the tool spec.
@@ -273,7 +280,10 @@ class NimbleAgentToolSpec(BaseToolSpec):
                 executing at the deadline raise
                 :class:`NimbleAgentTimeoutError` client-side; the server-side
                 run is not cancelled and can be fetched later via its
-                ``run_id``.
+                ``run_id``. Defaults to 1,800 seconds so omitted effort (whose
+                documented product default is ``high``) has headroom beyond
+                its typical 5–15 minute runtime. Set a shorter deadline
+                explicitly for low-effort or latency-bounded workflows.
             poll_interval: Seconds between status polls, and the pause before
                 re-attempting a transient failure. Defaults to 10 seconds;
                 shorter values are intended only for tests.
