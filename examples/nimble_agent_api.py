@@ -28,10 +28,7 @@ from llama_index.tools.nimble import NimbleAgentToolSpec
 
 
 async def main() -> None:
-    tool_spec = NimbleAgentToolSpec(
-        agent_id=os.environ.get("NIMBLE_AGENT_ID"),
-        timeout=1800,
-    )
+    tool_spec = NimbleAgentToolSpec(agent_id=os.environ.get("NIMBLE_AGENT_ID"))
     agent = FunctionAgent(
         tools=tool_spec.to_tool_list(),
         llm=OpenAI(model="gpt-4o-mini"),

@@ -357,9 +357,10 @@ class NimbleAgentToolSpec(BaseToolSpec):
         """Run a research task on a Nimble Web Search Agent.
 
         The agent researches the task on the live web and returns a final,
-        citation-backed answer. This is a long-running call: expect tens of
-        seconds. Use it for questions that need researched, synthesized
-        answers; use a plain search tool for quick lookups.
+        citation-backed answer. This is a long-running call: default-effort
+        research commonly takes 5–15 minutes. Use it for questions that need
+        researched, synthesized answers; use a plain search tool for quick
+        lookups.
 
         Args:
             task (str): The research task or question, in natural language.
