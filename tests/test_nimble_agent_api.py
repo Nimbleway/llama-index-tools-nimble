@@ -320,6 +320,14 @@ def test_agent_id_is_optional_at_construction(monkeypatch):
     assert NimbleAgentToolSpec().agent_id is None
 
 
+def test_default_timeout_covers_default_high_effort(monkeypatch):
+    """The default lifecycle deadline must outlast a typical high-effort run."""
+    import nimble_python
+
+    monkeypatch.setattr(nimble_python, "Nimble", lambda **kw: MagicMock())
+    assert NimbleAgentToolSpec().timeout == 1800.0
+
+
 # ------------------------------------------------------ C04: optional effort
 
 

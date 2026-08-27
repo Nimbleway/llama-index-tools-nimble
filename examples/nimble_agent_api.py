@@ -2,8 +2,8 @@
 
 The Nimble tool executes deep-research runs on a Web Search Agent; the
 LlamaIndex agent decides when to call it and relays the citation-backed
-answer. Agent runs take tens of seconds — this is a research tool, not a
-quick lookup.
+answer. Low-effort runs can finish in seconds, while the default high effort
+commonly takes 5–15 minutes — this is a research tool, not a quick lookup.
 
 Set NIMBLE_AGENT_ID to run on an agent you have provisioned; leave it unset
 and the API provisions one per run and returns its id.

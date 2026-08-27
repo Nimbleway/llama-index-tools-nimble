@@ -79,8 +79,9 @@ source; `metadata["url"]` and `metadata["title"]` carry the same values for prog
 ## Deep research with the Agent API
 
 `NimbleAgentToolSpec` executes research tasks on a Nimble **Web Search Agent**. Where
-`search` answers one query fast, an agent run researches the task on the live web —
-typically tens of seconds — and returns one synthesized, citation-backed answer.
+`search` answers one query fast, while an agent run researches the task on the live web
+and returns one synthesized, citation-backed answer. Low effort can finish in seconds;
+the default high effort commonly takes 5–15 minutes.
 
 ```python
 from llama_index.tools.nimble import NimbleAgentToolSpec
@@ -131,7 +132,7 @@ doc = agent_tool.run(
 | `skill` | `str \| None` | `None` | Optional SDK 1.2 skill identifier applied to the run. |
 | `use_case` | `research \| enrichment \| dataset_building \| None` | `None` | Optional SDK 1.2 run mode. |
 | `gate_policy` | `reject \| degrade` | `reject` | Treatment for gated values: stop with guidance, or explicitly and visibly use the closest generally available value. |
-| `timeout` | `float` | `300.0` | Overall deadline in seconds for one `run` call — creation, polling, and result retrieval together. Each HTTP request is bounded by the budget left when it is issued (with a 5 s connect ceiling), so a stalled request cannot fall back to the SDK's much longer default. |
+| `timeout` | `float` | `1800.0` | Overall deadline in seconds for one `run` call — creation, polling, and result retrieval together. The 30-minute default gives the default high-effort run headroom beyond its typical 5–15 minute runtime. Each HTTP request is bounded by the budget left when it is issued (with a 5 s connect ceiling), so a stalled request cannot fall back to the SDK's much longer default. Set a shorter deadline explicitly for low-effort or latency-bounded workflows. |
 | `poll_interval` | `float` | `10.0` | Seconds between status polls, and the pause before re-attempting a transient failure. It remains configurable; shorter values are intended only for tests. |
 
 ### `run(task, output_schema=None, input_data=None, sources=None)`
