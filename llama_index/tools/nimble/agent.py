@@ -3,7 +3,7 @@
 import json
 import time
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from random import random
 from typing import Any, Literal, get_args
@@ -177,7 +177,7 @@ def _retry_after_seconds(exc: APIError) -> float | None:
         parsed = parsedate_to_datetime(header)
     except (TypeError, ValueError):
         return None
-    return (parsed - datetime.now(parsed.tzinfo or timezone.utc)).total_seconds()
+    return (parsed - datetime.now(parsed.tzinfo or UTC)).total_seconds()
 
 
 def _is_retryable(exc: APIError, *, allow_conflict: bool = False) -> bool:
