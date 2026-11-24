@@ -940,8 +940,13 @@ name = "llama-index-tools-nimble"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio", version = "4.14.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.15'" },
+    { name = "anyio", version = "4.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.15'" },
+    { name = "certifi" },
     { name = "llama-index-core" },
     { name = "nimble-python" },
+    { name = "nltk" },
+    { name = "pillow" },
 ]
 
 [package.dev-dependencies]
@@ -963,8 +968,12 @@ typing = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.14.2" },
+    { name = "certifi", specifier = ">=2026.10.18" },
     { name = "llama-index-core", specifier = ">=0.13.0,<0.15" },
     { name = "nimble-python", specifier = ">=1.2.0,<2.0.0" },
+    { name = "nltk", specifier = ">=3.10.3" },
+    { name = "pillow", specifier = ">=13.0.0" },
 ]
 
 [package.metadata.requires-dev]

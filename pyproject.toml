@@ -13,6 +13,12 @@ requires-python = ">=3.11,<4.0"
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",
     "nimble-python>=1.2.0,<2.0.0",
+    # Security floors for packages pulled in by the two above, so a pip install
+    # upgrades them past known critical CVEs. Not imported by this package.
+    "anyio>=4.14.2",
+    "certifi>=2026.10.18",
+    "nltk>=3.10.3",
+    "pillow>=13.0.0",
 ]
 
 [project.urls]
